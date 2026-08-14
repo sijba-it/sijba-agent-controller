@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""Agent controller: thin process supervisor for sijba project sessions.
+
+Owns the registry (registry.py) and one dedicated "controller" control
+channel on sijba Core. Its only real job is *starting* things: for every
+`active` registry entry it keeps a session_client.py subprocess running,
+always restarting it with crash-loop backoff on unexpected exit — a
+controller reboot and a mid-run crash are handled by the exact same
+ensure_running() loop, no special-casing.
+
+Session processes are self-registering (their own WebSocket connection, own
+channel) and self-managing for /archive and /pause — they write their own
+registry status and exit with a reserved code (exit_codes.py) before the
+controller ever notices. Global commands (`controller archive <name>`, ...)
+go through the same registry + backoff-loop state via `_intentional_stop`,
+so a controller-initiated stop is never mistaken for a crash.
+
+Environment variables
+----------------------
+SIJBA_URL, SIJBA_TOKEN     same as session_client.py
+CLAUDE_CMD, CURSOR_CMD, CURSOR_ARGS   passed through to spawned sessions
+REGISTRY_FILE, WORKSPACE_ROOTS        see registry.py
+LLM_API_URL, LLM_API_KEY, LLM_MODEL, LLM_FORMAT   optional — same shape as
+    plugins-builtin/router/main.py. If LLM_API_KEY is unset, free text that
+    doesn't match an exact command just gets the command list back.
+"""
+from __future__ import annotations
+
+import asyncio
+import collections
+import json
+import os
+import shlex
+import signal
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import websockets
+
+import registry
+from exit_codes import EXIT_ARCHIVED, EXIT_PAUSED
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SIJBA_URL = os.environ.get("SIJBA_URL", "wss://sijba.edv-bartl.at")
+SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
+PLUGIN_ID = os.environ.get("PLUGIN_ID", "controller")
+CHANNEL_ID = "controller"
+SESSION_CLIENT = str(Path(__file__).parent / "session_client.py")
+PYTHON = sys.executable
+
+BACKOFF_BASE = 5.0
+BACKOFF_MAX = 300.0
+BACKOFF_RESET_AFTER = 60.0  # stayed up this long -> next failure starts back at BACKOFF_BASE
+
+LLM_API_URL = os.environ.get("LLM_API_URL", "https://openrouter.ai/api/v1").rstrip("/")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4o-mini")
+LLM_FORMAT = os.environ.get("LLM_FORMAT", "openai").lower()
+
+if not SIJBA_TOKEN:
+    print("ERROR: SIJBA_TOKEN environment variable required", file=sys.stderr)
+    sys.exit(1)
+
+_LOG_BUFFER: collections.deque[str] = collections.deque(maxlen=200)
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    line = f"{ts} [controller] {msg}"
+    _LOG_BUFFER.append(line)
+    print(line, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Process supervision
+# ---------------------------------------------------------------------------
+
+_procs: dict[str, asyncio.subprocess.Process] = {}
+_supervisors: dict[str, asyncio.Task] = {}
+_intentional_stop: dict[str, str] = {}  # name -> "archived" | "paused" | "removed", set right before killing
+
+
+def _spawn_env(name: str, entry: dict) -> dict:
+    env = dict(os.environ)
+    env.update({
+        "SIJBA_URL": SIJBA_URL,
+        "SIJBA_TOKEN": SIJBA_TOKEN,
+        "PROJECT_NAME": name,
+        "WORK_DIR": entry["path"],
+        "TOOL": entry["tool"],
+        "REGISTRY_FILE": str(registry.REGISTRY_FILE),
+    })
+    return env
+
+
+async def _spawn(name: str, entry: dict) -> asyncio.subprocess.Process:
+    proc = await asyncio.create_subprocess_exec(
+        PYTHON, SESSION_CLIENT,
+        cwd=str(Path(__file__).parent),
+        env=_spawn_env(name, entry),
+        # Inherit stdout/stderr — one combined journal stream, each line
+        # already prefixed with the project name by session_client's _log().
+    )
+    _procs[name] = proc
+    _log(f"{name}: started (pid={proc.pid}, tool={entry['tool']})")
+    return proc
+
+
+async def ensure_running(name: str) -> None:
+    """Supervises one project: (re)spawn while registry status is 'active',
+    with crash-loop backoff on unexpected exit. Same function for first
+    start, controller-reboot start, and post-crash restart."""
+    backoff = BACKOFF_BASE
+    while True:
+        entry = registry.get(name)
+        if entry is None or entry.get("status") != "active":
+            _supervisors.pop(name, None)
+            return
+
+        started_at = time.time()
+        try:
+            proc = await _spawn(name, entry)
+            code = await proc.wait()
+        except FileNotFoundError as exc:
+            _log(f"{name}: failed to spawn: {exc}")
+            code = None
+        finally:
+            _procs.pop(name, None)
+
+        uptime = time.time() - started_at
+
+        stop_reason = _intentional_stop.pop(name, None)
+        if stop_reason is not None:
+            _log(f"{name}: stopped ({stop_reason}, exit={code})")
+            _supervisors.pop(name, None)
+            return
+        if code == EXIT_ARCHIVED:
+            _log(f"{name}: self-archived (exit={code})")
+            _supervisors.pop(name, None)
+            return
+        if code == EXIT_PAUSED:
+            _log(f"{name}: self-paused (exit={code})")
+            _supervisors.pop(name, None)
+            return
+
+        # Unplanned exit -> crash-loop backoff. Re-check status each spin so
+        # a concurrent archive/remove during the sleep still takes effect.
+        backoff = BACKOFF_BASE if uptime >= BACKOFF_RESET_AFTER else min(backoff * 2, BACKOFF_MAX)
+        _log(f"{name}: crashed (exit={code}, uptime={uptime:.0f}s) — restart in {backoff:.0f}s")
+        await asyncio.sleep(backoff)
+
+
+def start_supervising(name: str) -> None:
+    if name in _supervisors:
+        return
+    _supervisors[name] = asyncio.create_task(ensure_running(name))
+
+
+async def stop_process(name: str, reason: str) -> None:
+    """Controller-initiated stop (as opposed to the session archiving/pausing
+    itself) — mark intentional so the supervisor loop doesn't treat the exit
+    as a crash, then terminate the child if one is running."""
+    _intentional_stop[name] = reason
+    proc = _procs.get(name)
+    if proc and proc.returncode is None:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+    else:
+        # Nothing running (e.g. mid-backoff-sleep) — nothing to terminate,
+        # but the supervisor loop will see the flag on its next spin.
+        pass
+
+
+def boot() -> None:
+    for name, entry in registry.list_projects(status="active").items():
+        start_supervising(name)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic command handlers — the actual side effects. Both the exact
+# "controller <cmd> ..." syntax and the optional LLM tool-calling layer
+# below call into these same functions; the LLM never executes anything
+# itself.
+# ---------------------------------------------------------------------------
+
+def cmd_list() -> str:
+    projects = registry.list_projects()
+    if not projects:
+        return "No projects registered."
+    lines = []
+    for name, e in sorted(projects.items()):
+        live = "running" if name in _procs else ("supervised" if name in _supervisors else "-")
+        lines.append(f"- {name}: {e['tool']} @ {e['path']} [{e['status']}/{live}]")
+    return "\n".join(lines)
+
+
+def cmd_paths(filter_str: str = "") -> str:
+    hits = registry.search_paths(filter_str)
+    if not hits:
+        return f"No directories matching {filter_str!r} under {registry.roots()}"
+    return "\n".join(hits)
+
+
+def cmd_mkdir(name: str, root: Optional[str] = None) -> str:
+    path = registry.mkdir(name, root)
+    return f"Created {path}"
+
+
+def cmd_add(name: str, path: Optional[str] = None, tool: str = "claude") -> str:
+    if path is None:
+        hits = registry.search_paths(name)
+        if len(hits) == 1:
+            path = hits[0]
+        elif len(hits) > 1:
+            return "Multiple matches, be specific with --path:\n" + "\n".join(hits)
+        else:
+            return f"No directory found for {name!r}. Use 'mkdir {name}' to create one first, or pass --path."
+    entry = registry.add(name, path, tool)
+    start_supervising(name)
+    return f"Added {name}: {entry['tool']} @ {entry['path']}, starting."
+
+
+def cmd_status(name: str) -> str:
+    entry = registry.get(name)
+    if entry is None:
+        return f"No such project: {name}"
+    live = "running" if name in _procs else ("supervised (starting/backoff)" if name in _supervisors else "stopped")
+    return (
+        f"{name}\n  path: {entry['path']}\n  tool: {entry['tool']}\n"
+        f"  status: {entry['status']}\n  live: {live}"
+    )
+
+
+async def cmd_archive(name: str) -> str:
+    if registry.get(name) is None:
+        return f"No such project: {name}"
+    registry.set_status(name, "archived")
+    await stop_process(name, "archived")
+    return f"{name} archived."
+
+
+async def cmd_pause(name: str) -> str:
+    if registry.get(name) is None:
+        return f"No such project: {name}"
+    registry.set_status(name, "paused")
+    await stop_process(name, "paused")
+    return f"{name} paused."
+
+
+def cmd_restore(name: str) -> str:
+    entry = registry.get(name)
+    if entry is None:
+        return f"No such project: {name}"
+    registry.set_status(name, "active")
+    start_supervising(name)
+    return f"{name} restored, starting."
+
+
+async def cmd_remove(name: str, wipe: bool = False) -> str:
+    entry = registry.get(name)
+    if entry is None:
+        return f"No such project: {name}"
+    await stop_process(name, "removed")
+    registry.remove(name)
+    msg = f"{name} removed from registry."
+    if wipe:
+        import shutil
+        shutil.rmtree(entry["path"], ignore_errors=True)
+        msg += f" Directory {entry['path']} wiped."
+    return msg
+
+
+def cmd_log(n: int = 10) -> str:
+    lines = list(_LOG_BUFFER)[-n:]
+    return "\n".join(lines) or "(no logs yet)"
+
+
+# ---------------------------------------------------------------------------
+# "controller <cmd> ..." exact-syntax dispatcher
+# ---------------------------------------------------------------------------
+
+def _parse_args(rest: str) -> tuple[list[str], dict[str, str]]:
+    tokens = shlex.split(rest)
+    positional, flags = [], {}
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.startswith("--"):
+            key = t[2:]
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                flags[key] = tokens[i + 1]
+                i += 2
+            else:
+                flags[key] = "true"
+                i += 1
+        else:
+            positional.append(t)
+            i += 1
+    return positional, flags
+
+
+HELP = (
+    "Commands: list | add <name> [--path P] [--tool claude|cursor] | "
+    "mkdir <name> [--root R] | paths [filter] | status <name> | "
+    "archive <name> | pause <name> | restore <name> | remove <name> [--wipe] | log [n]"
+)
+
+
+async def dispatch_command(text: str) -> Optional[str]:
+    """Try to handle `text` as an exact 'controller <cmd> ...' command.
+    Returns the reply, or None if it doesn't match any known command (so the
+    caller can fall back to the LLM layer, or just say "unrecognized")."""
+    cmd, _, rest = text.strip().partition(" ")
+    cmd = cmd.lower()
+    try:
+        if cmd == "list":
+            return cmd_list()
+        if cmd == "paths":
+            return cmd_paths(rest.strip())
+        if cmd == "log":
+            n = int(rest.strip()) if rest.strip().isdigit() else 10
+            return cmd_log(n)
+        if cmd == "mkdir":
+            pos, flags = _parse_args(rest)
+            if not pos:
+                return "usage: mkdir <name> [--root R]"
+            return cmd_mkdir(pos[0], flags.get("root"))
+        if cmd == "add":
+            pos, flags = _parse_args(rest)
+            if not pos:
+                return "usage: add <name> [--path P] [--tool claude|cursor]"
+            return cmd_add(pos[0], flags.get("path"), flags.get("tool", "claude"))
+        if cmd == "status":
+            pos, _ = _parse_args(rest)
+            if not pos:
+                return "usage: status <name>"
+            return cmd_status(pos[0])
+        if cmd == "archive":
+            pos, _ = _parse_args(rest)
+            if not pos:
+                return "usage: archive <name>"
+            return await cmd_archive(pos[0])
+        if cmd == "pause":
+            pos, _ = _parse_args(rest)
+            if not pos:
+                return "usage: pause <name>"
+            return await cmd_pause(pos[0])
+        if cmd in ("restore", "resume"):
+            pos, _ = _parse_args(rest)
+            if not pos:
+                return f"usage: {cmd} <name>"
+            return cmd_restore(pos[0])
+        if cmd == "remove":
+            pos, flags = _parse_args(rest)
+            if not pos:
+                return "usage: remove <name> [--wipe]"
+            return await cmd_remove(pos[0], flags.get("wipe") == "true")
+        if cmd in ("help", ""):
+            return HELP
+    except Exception as exc:
+        return f"Error: {exc}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Optional LLM tool-calling layer — only used for free text that doesn't
+# match an exact command above. Same OpenRouter-style config as
+# plugins-builtin/router/main.py. The LLM only ever selects/parameterizes
+# one of the cmd_* functions above via tool_calls; it never has a side
+# effect of its own.
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_projects", "description": "List all registered projects with status.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "list_paths", "description": "Search directories under the configured workspace roots.",
+        "parameters": {"type": "object", "properties": {
+            "filter": {"type": "string", "description": "substring to match against directory names"}
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "mkdir", "description": "Create a brand-new project directory. Does not register it.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "root": {"type": "string"}
+        }, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "add_project", "description": "Register a project and start its session. Omit path to auto-search by name.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "path": {"type": "string"},
+            "tool": {"type": "string", "enum": ["claude", "cursor"]},
+        }, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "status", "description": "Show details for one project.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "archive_project", "description": "Stop a project's session, no auto-restart.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "restore_project", "description": "Reactivate an archived/paused project.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "remove_project", "description": "Unregister a project. wipe=true also deletes its directory.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "wipe": {"type": "boolean"}
+        }, "required": ["name"]},
+    }},
+]
+
+_TOOL_IMPL = {
+    "list_projects": lambda **kw: cmd_list(),
+    "list_paths": lambda **kw: cmd_paths(kw.get("filter", "")),
+    "mkdir": lambda **kw: cmd_mkdir(kw["name"], kw.get("root")),
+    "add_project": lambda **kw: cmd_add(kw["name"], kw.get("path"), kw.get("tool", "claude")),
+    "status": lambda **kw: cmd_status(kw["name"]),
+    "archive_project": lambda **kw: cmd_archive(kw["name"]),
+    "restore_project": lambda **kw: cmd_restore(kw["name"]),
+    "remove_project": lambda **kw: cmd_remove(kw["name"], kw.get("wipe", False)),
+}
+
+SYSTEM_PROMPT = (
+    "You are the sijba agent controller. You manage coding-agent sessions, one per "
+    "project directory. Use the tools to inspect and mutate registered projects. "
+    "When creating a project whose exact path is unknown, call list_paths first; if "
+    "nothing matches, call mkdir, then add_project with the resulting path. Keep replies short."
+)
+
+
+def _post(url: str, payload: dict, extra_headers: dict = None) -> dict:
+    data = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+async def run_llm_turn(user_text: str) -> str:
+    if not LLM_API_KEY:
+        return f"Unrecognized command. {HELP}"
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_text},
+    ]
+    loop = asyncio.get_event_loop()
+    for _ in range(5):
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                lambda: _post(f"{LLM_API_URL}/chat/completions",
+                               {"model": LLM_MODEL, "messages": messages, "tools": TOOLS, "temperature": 0.2}),
+            )
+        except urllib.error.HTTPError as exc:
+            return f"LLM error: HTTP {exc.code}"
+        except Exception as exc:
+            return f"LLM error: {exc}"
+
+        msg = resp["choices"][0]["message"]
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            return msg.get("content") or "(no reply)"
+
+        messages.append(msg)
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            try:
+                fn_args = json.loads(tc["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                fn_args = {}
+            impl = _TOOL_IMPL.get(fn_name)
+            if impl is None:
+                result = f"unknown tool {fn_name}"
+            else:
+                try:
+                    out = impl(**fn_args)
+                    result = await out if asyncio.iscoroutine(out) else out
+                except Exception as exc:
+                    result = f"error: {exc}"
+            _log(f"llm tool_call {fn_name}({fn_args}) -> {str(result)[:200]!r}")
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
+
+    return "Gave up after 5 tool-call rounds."
+
+
+# ---------------------------------------------------------------------------
+# sijba plugin protocol (control channel)
+# ---------------------------------------------------------------------------
+
+class ControllerClient:
+    def __init__(self):
+        self.ws = None
+        self.shutdown_event = asyncio.Event()
+        self._reconnect_backoff = 5
+
+    async def connect(self):
+        ws_url = SIJBA_URL.replace("https://", "wss://").replace("http://", "ws://")
+        ws_url = f"{ws_url}/api/plugin/ws?token={SIJBA_TOKEN}"
+        _log(f"Connecting to {ws_url} as {PLUGIN_ID}")
+        self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=10, close_timeout=5)
+        _log("Connected!")
+
+        await self.ws.send(json.dumps({
+            "type": "register",
+            "plugin_id": PLUGIN_ID,
+            "capabilities": ["conversation", "tools"],
+            "channels": {
+                CHANNEL_ID: {
+                    "label": "Agent Controller",
+                    "hint": (
+                        "Manage per-project coding-agent sessions. Trigger: 'controller ...'. " + HELP
+                    ),
+                    "triggers": ["controller", "@controller"],
+                    "capabilities": ["admin"],
+                    "metadata": {},
+                }
+            },
+        }))
+        self._reconnect_backoff = 5
+        await self.message_loop()
+
+    async def message_loop(self):
+        try:
+            async for raw in self.ws:
+                msg = json.loads(raw)
+                mtype = msg.get("type")
+                if mtype == "registered":
+                    _log(f"Plugin registered: {msg['plugin_id']}")
+                elif mtype == "channel_registered":
+                    _log(f"Channel registered: {msg['channel_id']} (ok={msg.get('ok')})")
+                elif mtype == "message":
+                    await self.handle_message(msg)
+                elif mtype == "ping":
+                    await self.ws.send(json.dumps({"type": "pong"}))
+                elif mtype == "error":
+                    _log(f"Server error: {msg.get('message')}")
+        except websockets.ConnectionClosed:
+            _log("Connection closed")
+        except Exception as exc:
+            _log(f"Message loop error: {exc}")
+
+    async def handle_message(self, msg: dict):
+        channel_id = msg["channel"]
+        payload = msg["payload"]
+        envelope_id = payload["envelope_id"]
+        text = payload["text"]
+
+        for trigger in ("controller", "@controller"):
+            if text.lower().startswith(trigger):
+                text = text[len(trigger):].strip()
+                break
+        if not text:
+            text = "help"
+
+        reply = await dispatch_command(text)
+        if reply is None:
+            reply = await run_llm_turn(text)
+
+        try:
+            await self.ws.send(json.dumps({
+                "type": "reply", "channel": channel_id, "envelope_id": envelope_id,
+                "text": reply, "continue": True,
+            }))
+        except Exception as exc:
+            _log(f"Failed to send reply: {exc}")
+
+    async def run_forever(self):
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self.shutdown_event.set)
+            except NotImplementedError:
+                pass
+
+        while not self.shutdown_event.is_set():
+            try:
+                await self.connect()
+            except Exception as exc:
+                _log(f"Connection failed: {exc}")
+            if self.shutdown_event.is_set():
+                break
+            _log(f"Reconnecting in {self._reconnect_backoff}s...")
+            try:
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=self._reconnect_backoff)
+            except asyncio.TimeoutError:
+                pass
+            self._reconnect_backoff = min(self._reconnect_backoff * 2, 300)
+
+        _log("Shutdown complete")
+
+
+async def main() -> None:
+    boot()
+    client = ControllerClient()
+    await client.run_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
