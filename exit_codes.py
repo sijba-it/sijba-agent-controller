@@ -1,4 +1,6 @@
-"""Exit-code convention shared between controller.py and session_client.py.
+"""Exit-code convention between controller.py and plugin processes (see
+catalog.py — every plugin, including claude/cursor, is its own repo that
+embeds these same two numbers rather than importing this module).
 
 A session process signals *why* it stopped through its own exit code instead
 of through a side-channel message — the controller supervises the OS process

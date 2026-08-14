@@ -4,10 +4,11 @@ and whether they should currently be running.
 
 A JSON file, not a database — matches the "config is JSON/YAML, readable
 without a framework diagram" spirit of the rest of sijba. Both controller.py
-(add/mkdir/archive/restore/remove/list/status) and session_client.py (which
-flips its own entry to "archived"/"paused" right before it exits) read and
-write this file directly, so all writes go through `_locked()` to avoid two
-processes clobbering each other on a read-modify-write.
+(add/mkdir/archive/restore/remove/list/status) and the running plugin
+processes (which flip their own entry to "archived"/"paused" right before
+they exit) read and write this file directly, so all writes go through
+`_locked()` to avoid two processes clobbering each other on a
+read-modify-write.
 """
 from __future__ import annotations
 

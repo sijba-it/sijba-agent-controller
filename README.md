@@ -1,9 +1,14 @@
 # sijba-agent-controller
 
-Process supervisor for per-project coding-agent sessions (Claude Code /
-Cursor Agent), controllable from sijba chat. Replaces the two previous
-one-off scripts (`sijba_plugin_client.py`, `sijba-cursor-plugin/`), each of
-which was wired to exactly one fixed directory.
+Process supervisor for per-project coding-agent sessions, controllable from
+sijba chat. Replaces the two previous one-off scripts
+(`sijba_plugin_client.py`, `sijba-cursor-plugin/`'s old
+`cursor_plugin_client.py`), each of which was wired to exactly one fixed
+directory and ran as its own standalone systemd service — that code now
+lives in [sijba-claude-plugin](https://REDACTED-GIT-HOST/sijba/sijba-claude-plugin)
+and [sijba-cursor-plugin](https://REDACTED-GIT-HOST/sijba/sijba-cursor-plugin)
+as `main.py`, one project directory per registry entry, supervised by this
+controller instead.
 
 ## How it fits together
 
@@ -15,37 +20,43 @@ which was wired to exactly one fixed directory.
   go through the exact same code path — nothing special to handle on
   reboot.
 - **`catalog.py`** — the plugin catalog: which backends the controller
-  knows how to run, and where they come from. Claude and Cursor are just
-  the two `kind: builtin` entries (both live inside `session_client.py`);
-  you can add your own `kind: git` (repo URL, cloned on first use) or
-  `kind: docker` (image, pulled on first use) plugins. Unlike
-  `registry.json` this **is** committed — it's config (what's possible),
-  not local runtime state (what's currently running).
-- **`session_client.py`** — the built-in plugin implementation (`claude` and
-  `cursor`). One process per project. Self-registers its own sijba channel
-  (own WebSocket connection, independent of the controller), runs the
-  actual Claude/Cursor turns, and handles `/archive`, `/pause`, `/log [n]`
-  locally. On `/archive` or `/pause` it writes its own registry status and
-  exits with a reserved code (`exit_codes.py`) *before* stopping — the
-  controller reads that exit code (or, for controller-initiated stops, its
-  own `_intentional_stop` flag) to tell "stopped on purpose" apart from
-  "crashed", so only the latter triggers a backoff-restart.
+  knows how to run, and where they come from. There's no special-cased
+  "builtin" — Claude and Cursor are `kind: git` entries too, pointing at
+  [sijba-claude-plugin](https://REDACTED-GIT-HOST/sijba/sijba-claude-plugin)
+  and [sijba-cursor-plugin](https://REDACTED-GIT-HOST/sijba/sijba-cursor-plugin)
+  respectively. You can add your own `kind: git` (repo URL, cloned on first
+  use) or `kind: docker` (image, pulled on first use) plugins the same way.
+  Unlike `registry.json` this **is** committed — it's config (what's
+  possible), not local runtime state (what's currently running).
 - **`registry.py`** — the shared JSON file both the controller and running
   plugin processes read/write (`registry.json`, gitignored — local machine
   state, not config).
 
-### Custom plugins
+### Plugin contract
 
-A `kind: git` catalog entry must contain a `main.py` at its repo root
-implementing the same contract as `session_client.py`: read
-`SIJBA_URL`/`SIJBA_TOKEN`/`PROJECT_NAME`/`WORK_DIR`/`REGISTRY_FILE` from
-its environment, self-register a sijba channel, and (optionally) honor
-`/archive`/`/pause` by writing its own registry status and exiting with
-`exit_codes.EXIT_ARCHIVED`/`EXIT_PAUSED`. It's cloned into `_plugins/<name>/`
-(gitignored — fetched content, not authored here) the first time a project
-uses it, then re-`git pull`ed on subsequent adds.
+Every catalog entry is a separate, independent repo/image — nothing here
+imports the controller's own code. A `kind: git` entry must contain a
+`main.py` at its repo root that:
 
-A `kind: docker` entry just needs an image that honors the same env vars;
+- reads `SIJBA_URL`/`SIJBA_TOKEN`/`PROJECT_NAME`/`WORK_DIR`/`REGISTRY_FILE`
+  from its environment
+- self-registers its own sijba channel (own WebSocket connection,
+  independent of the controller)
+- handles `/archive` and `/pause` locally: writes its own status directly
+  into `REGISTRY_FILE`'s JSON (see `_set_registry_status` in
+  [sijba-claude-plugin/main.py](https://REDACTED-GIT-HOST/sijba/sijba-claude-plugin)
+  for the reference implementation — no shared import, just the same JSON
+  shape) and exits with a reserved code (`90` archived / `91` paused,
+  `exit_codes.py`) *before* actually stopping
+- handles `/log [n]` from its own in-memory log buffer
+
+The controller reads that exit code (or, for controller-initiated stops,
+its own `_intentional_stop` flag) to tell "stopped on purpose" apart from
+"crashed", so only the latter triggers a backoff-restart. It's cloned into
+`_plugins/<name>/` (gitignored — fetched content, not authored here) the
+first time a project uses it, then re-`git pull`ed on subsequent adds.
+
+A `kind: docker` entry just needs an image that honors the same contract;
 the controller runs it with `WORK_DIR` mounted at `/work` and
 `REGISTRY_FILE` mounted at `/registry.json` inside the container.
 
@@ -101,7 +112,9 @@ sudo systemctl enable --now sijba-agent-controller
 ```
 
 Once projects are running through the controller, retire the two old
-services it replaces:
+standalone services it replaces (`sijba-claude-plugin.service`,
+`sijba-cursor-plugin.service`, if you had them installed) — the controller
+now spawns the same code from the catalog instead:
 
 ```bash
 sudo systemctl disable --now sijba-claude-plugin sijba-cursor-plugin

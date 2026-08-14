@@ -23,18 +23,20 @@ CATALOG_FILE = Path(os.environ.get("CATALOG_FILE", Path(__file__).parent / "cata
 # here — gitignored, same reasoning as registry.json.
 PLUGINS_DIR = Path(os.environ.get("PLUGINS_DIR", Path(__file__).parent / "_plugins"))
 
-KINDS = {"builtin", "git", "docker"}
+KINDS = {"git", "docker"}
+
+_GITEA = "ssh://git@REDACTED-GIT-HOST:7999/sijba"
 
 
 def _default_data() -> dict:
     return {
         "claude": {
-            "kind": "builtin", "backend": "claude",
-            "description": "Claude Code CLI, persistent session (session_client.py built-in)",
+            "kind": "git", "url": f"{_GITEA}/sijba-claude-plugin.git", "ref": None,
+            "description": "Claude Code CLI, persistent session",
         },
         "cursor": {
-            "kind": "builtin", "backend": "cursor",
-            "description": "Cursor Agent CLI, one-shot turns via --resume (session_client.py built-in)",
+            "kind": "git", "url": f"{_GITEA}/sijba-cursor-plugin.git", "ref": None,
+            "description": "Cursor Agent CLI, one-shot turns via --resume",
         },
     }
 

@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """Agent controller: thin process supervisor for sijba project sessions.
 
-Owns the registry (registry.py) and one dedicated "controller" control
-channel on sijba Core. Its only real job is *starting* things: for every
-`active` registry entry it keeps a session_client.py subprocess running,
-always restarting it with crash-loop backoff on unexpected exit — a
-controller reboot and a mid-run crash are handled by the exact same
-ensure_running() loop, no special-casing.
+Owns the registry (registry.py), the plugin catalog (catalog.py), and one
+dedicated "controller" control channel on sijba Core. Its only real job is
+*starting* things: for every `active` registry entry it keeps its plugin's
+process running, always restarting it with crash-loop backoff on
+unexpected exit — a controller reboot and a mid-run crash are handled by
+the exact same ensure_running() loop, no special-casing.
 
-Session processes are self-registering (their own WebSocket connection, own
-channel) and self-managing for /archive and /pause — they write their own
-registry status and exit with a reserved code (exit_codes.py) before the
-controller ever notices. Global commands (`controller archive <name>`, ...)
-go through the same registry + backoff-loop state via `_intentional_stop`,
-so a controller-initiated stop is never mistaken for a crash.
+Every plugin (including claude and cursor — see catalog.py) is a `kind:
+git` or `kind: docker` catalog entry, fetched once at `add` time and run as
+its own process. Those processes are self-registering (their own
+WebSocket connection, own channel) and self-managing for /archive and
+/pause — they write their own registry status and exit with a reserved
+code (exit_codes.py) before the controller ever notices. Global commands
+(`controller archive <name>`, ...) go through the same registry +
+backoff-loop state via `_intentional_stop`, so a controller-initiated stop
+is never mistaken for a crash.
 
 Environment variables
 ----------------------
-SIJBA_URL, SIJBA_TOKEN     same as session_client.py
-CLAUDE_CMD, CURSOR_CMD, CURSOR_ARGS   passed through to spawned sessions
-REGISTRY_FILE, WORKSPACE_ROOTS        see registry.py
+SIJBA_URL, SIJBA_TOKEN                same as any sijba plugin
+REGISTRY_FILE, WORKSPACE_ROOTS         see registry.py
+CATALOG_FILE, PLUGINS_DIR              see catalog.py
 LLM_API_URL, LLM_API_KEY, LLM_MODEL, LLM_FORMAT   optional — same shape as
     plugins-builtin/router/main.py. If LLM_API_KEY is unset, free text that
     doesn't match an exact command just gets the command list back.
@@ -54,7 +57,6 @@ SIJBA_URL = os.environ.get("SIJBA_URL", "wss://sijba.edv-bartl.at")
 SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
 PLUGIN_ID = os.environ.get("PLUGIN_ID", "controller")
 CHANNEL_ID = "controller"
-SESSION_CLIENT = str(Path(__file__).parent / "session_client.py")
 PYTHON = sys.executable
 
 BACKOFF_BASE = 5.0
@@ -103,7 +105,7 @@ def _spawn_env(name: str, entry: dict) -> dict:
 
 
 async def ensure_fetched(plugin_name: str, plugin: dict) -> None:
-    """One-time fetch for non-builtin plugins. Runs at `add` time, not on
+    """One-time fetch for a plugin's code. Runs at `add` time, not on
     every (re)spawn — a crash-loop shouldn't hammer git/docker on every
     retry, and it keeps fetch failures a distinct, immediately-reported
     error instead of getting lost in the backoff loop's log spam."""
@@ -133,9 +135,6 @@ async def ensure_fetched(plugin_name: str, plugin: dict) -> None:
 def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dict]:
     """Build (argv, env) for this project, dispatched on its plugin's kind."""
     env = _spawn_env(name, entry)
-    if plugin["kind"] == "builtin":
-        env["TOOL"] = plugin["backend"]
-        return [PYTHON, SESSION_CLIENT], env
     if plugin["kind"] == "git":
         entry_point = catalog.PLUGINS_DIR / entry["plugin"] / "main.py"
         return [PYTHON, str(entry_point)], env
@@ -356,9 +355,7 @@ def cmd_catalog_list() -> str:
         return "No plugins in catalog."
     lines = []
     for name, p in sorted(plugins.items()):
-        if p["kind"] == "builtin":
-            detail = f"backend={p['backend']}"
-        elif p["kind"] == "git":
+        if p["kind"] == "git":
             detail = p["url"] + (f"@{p['ref']}" if p.get("ref") else "")
         elif p["kind"] == "docker":
             detail = p["image"]
@@ -551,7 +548,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "add_git_plugin",
         "description": "Register a new plugin sourced from a git repo. The repo must contain main.py "
-                        "at its root implementing the same self-registering protocol as session_client.py.",
+                        "at its root implementing the plugin contract (see sijba-claude-plugin for an example).",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "url": {"type": "string"},
             "ref": {"type": "string"}, "description": {"type": "string"},
@@ -586,11 +583,12 @@ _TOOL_IMPL = {
 
 SYSTEM_PROMPT = (
     "You are the sijba agent controller. You manage coding-agent sessions, one per "
-    "project directory, each backed by a plugin from the catalog (claude and cursor are "
-    "built in; call list_catalog to see custom git/docker ones). Use the tools to inspect "
-    "and mutate registered projects and the catalog. When creating a project whose exact "
-    "path is unknown, call list_paths first; if nothing matches, call mkdir, then "
-    "add_project with the resulting path. Keep replies short."
+    "project directory, each backed by a plugin from the catalog (call list_catalog to "
+    "see what's available — normally at least claude and cursor, plus any custom git/"
+    "docker ones). Use the tools to inspect and mutate registered projects and the "
+    "catalog. When creating a project whose exact path is unknown, call list_paths "
+    "first; if nothing matches, call mkdir, then add_project with the resulting path. "
+    "Keep replies short."
 )
 
 
