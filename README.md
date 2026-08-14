@@ -66,10 +66,17 @@ the controller runs it with `WORK_DIR` mounted at `/work` and
 Not every useful process fits the "self-registers a sijba channel" contract
 above. `kind: local` is the escape hatch: just a command (`{name}`/
 `{work_dir}` placeholders filled in at spawn time), run in the project's
-directory, wrapped in `script -qc "..." /dev/null` so it always gets a real
-pty — some commands need one (an *interactive* session), and `script`'s own
-exit is tied to the wrapped command's, so crash-loop backoff still sees the
-right process lifetime either way.
+directory inside a named tmux session, `sijba-<project>` — some commands
+need a real terminal (an *interactive* session), and wrapping in tmux means
+you can also `tmux attach -t sijba-<project>` from an actual shell, not
+just however the command itself pairs with you. Wrapped once more in
+`script -qc "..." /dev/null` since tmux itself needs something that looks
+like a terminal to attach *from*, and the controller runs headless
+(systemd, no tty) — `script`'s own exit stays tied to the tmux session's
+actual lifetime either way, so crash-loop backoff still sees the right
+process lifetime. stdout/stderr are muted for this kind (tmux's raw ANSI
+screen redraws are noise in the shared journal, not useful for
+troubleshooting) — unlike git/docker plugins, which still inherit.
 
 The seeded example is `remote-control`:
 
