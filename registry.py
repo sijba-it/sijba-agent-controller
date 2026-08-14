@@ -1,6 +1,6 @@
 """Project registry: the single source of truth for which projects the
-controller knows about, where they live, which tool runs them, and whether
-they should currently be running.
+controller knows about, where they live, which catalog plugin runs them,
+and whether they should currently be running.
 
 A JSON file, not a database — matches the "config is JSON/YAML, readable
 without a framework diagram" spirit of the rest of sijba. Both controller.py
@@ -18,6 +18,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
+
+import catalog
 
 REGISTRY_FILE = Path(os.environ.get("REGISTRY_FILE", Path(__file__).parent / "registry.json"))
 
@@ -79,15 +81,15 @@ def get(name: str) -> Optional[dict]:
     return load()["projects"].get(name)
 
 
-def add(name: str, path: str, tool: str) -> dict:
-    if tool not in ("claude", "cursor"):
-        raise ValueError(f"unknown tool {tool!r} (expected claude|cursor)")
+def add(name: str, path: str, plugin: str) -> dict:
+    if catalog.get(plugin) is None:
+        raise ValueError(f"unknown plugin {plugin!r} — see 'catalog list'")
     with _locked() as data:
         if name in data["projects"]:
             raise ValueError(f"project {name!r} already registered")
         entry = {
             "path": str(path),
-            "tool": tool,
+            "plugin": plugin,
             "status": "active",
             "created_at": time.time(),
         }

@@ -42,6 +42,7 @@ from typing import Optional
 
 import websockets
 
+import catalog
 import registry
 from exit_codes import EXIT_ARCHIVED, EXIT_PAUSED
 
@@ -89,28 +90,84 @@ _intentional_stop: dict[str, str] = {}  # name -> "archived" | "paused" | "remov
 
 
 def _spawn_env(name: str, entry: dict) -> dict:
+    """Env vars common to every plugin kind."""
     env = dict(os.environ)
     env.update({
         "SIJBA_URL": SIJBA_URL,
         "SIJBA_TOKEN": SIJBA_TOKEN,
         "PROJECT_NAME": name,
         "WORK_DIR": entry["path"],
-        "TOOL": entry["tool"],
         "REGISTRY_FILE": str(registry.REGISTRY_FILE),
     })
     return env
 
 
+async def ensure_fetched(plugin_name: str, plugin: dict) -> None:
+    """One-time fetch for non-builtin plugins. Runs at `add` time, not on
+    every (re)spawn — a crash-loop shouldn't hammer git/docker on every
+    retry, and it keeps fetch failures a distinct, immediately-reported
+    error instead of getting lost in the backoff loop's log spam."""
+    if plugin["kind"] == "git":
+        dest = catalog.PLUGINS_DIR / plugin_name
+        if dest.exists():
+            cmd = ["git", "-C", str(dest), "pull"]
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            cmd = ["git", "clone"]
+            if plugin.get("ref"):
+                cmd += ["--branch", plugin["ref"]]
+            cmd += [plugin["url"], str(dest)]
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        code = await proc.wait()
+        if code != 0:
+            raise RuntimeError(f"git fetch failed for {plugin_name!r} (exit {code})")
+        if not (dest / "main.py").exists():
+            raise RuntimeError(f"{plugin_name!r}: expected {dest / 'main.py'} (git plugin convention)")
+    elif plugin["kind"] == "docker":
+        proc = await asyncio.create_subprocess_exec("docker", "pull", plugin["image"])
+        code = await proc.wait()
+        if code != 0:
+            raise RuntimeError(f"docker pull failed for {plugin_name!r} (exit {code})")
+
+
+def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dict]:
+    """Build (argv, env) for this project, dispatched on its plugin's kind."""
+    env = _spawn_env(name, entry)
+    if plugin["kind"] == "builtin":
+        env["TOOL"] = plugin["backend"]
+        return [PYTHON, SESSION_CLIENT], env
+    if plugin["kind"] == "git":
+        entry_point = catalog.PLUGINS_DIR / entry["plugin"] / "main.py"
+        return [PYTHON, str(entry_point)], env
+    if plugin["kind"] == "docker":
+        cmd = [
+            "docker", "run", "--rm", "--name", f"sijba-{name}",
+            "-v", f"{entry['path']}:/work",
+            "-v", f"{registry.REGISTRY_FILE}:/registry.json",
+            "-e", f"SIJBA_URL={SIJBA_URL}", "-e", f"SIJBA_TOKEN={SIJBA_TOKEN}",
+            "-e", f"PROJECT_NAME={name}", "-e", "WORK_DIR=/work",
+            "-e", "REGISTRY_FILE=/registry.json",
+            plugin["image"],
+        ]
+        # Env vars for a container go via -e above, not the docker CLI's own env.
+        return cmd, dict(os.environ)
+    raise RuntimeError(f"unknown plugin kind {plugin['kind']!r}")
+
+
 async def _spawn(name: str, entry: dict) -> asyncio.subprocess.Process:
+    plugin = catalog.get(entry["plugin"])
+    if plugin is None:
+        raise RuntimeError(f"catalog has no plugin {entry['plugin']!r}")
+    argv, env = _spawn_command(name, entry, plugin)
     proc = await asyncio.create_subprocess_exec(
-        PYTHON, SESSION_CLIENT,
+        *argv,
         cwd=str(Path(__file__).parent),
-        env=_spawn_env(name, entry),
+        env=env,
         # Inherit stdout/stderr — one combined journal stream, each line
-        # already prefixed with the project name by session_client's _log().
+        # already prefixed with the project name by the plugin's own _log().
     )
     _procs[name] = proc
-    _log(f"{name}: started (pid={proc.pid}, tool={entry['tool']})")
+    _log(f"{name}: started (pid={proc.pid}, plugin={entry['plugin']})")
     return proc
 
 
@@ -201,7 +258,7 @@ def cmd_list() -> str:
     lines = []
     for name, e in sorted(projects.items()):
         live = "running" if name in _procs else ("supervised" if name in _supervisors else "-")
-        lines.append(f"- {name}: {e['tool']} @ {e['path']} [{e['status']}/{live}]")
+        lines.append(f"- {name}: {e['plugin']} @ {e['path']} [{e['status']}/{live}]")
     return "\n".join(lines)
 
 
@@ -217,7 +274,10 @@ def cmd_mkdir(name: str, root: Optional[str] = None) -> str:
     return f"Created {path}"
 
 
-def cmd_add(name: str, path: Optional[str] = None, tool: str = "claude") -> str:
+async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "claude") -> str:
+    plugin_entry = catalog.get(plugin)
+    if plugin_entry is None:
+        return f"Unknown plugin {plugin!r}. See 'catalog list'."
     if path is None:
         hits = registry.search_paths(name)
         if len(hits) == 1:
@@ -226,9 +286,13 @@ def cmd_add(name: str, path: Optional[str] = None, tool: str = "claude") -> str:
             return "Multiple matches, be specific with --path:\n" + "\n".join(hits)
         else:
             return f"No directory found for {name!r}. Use 'mkdir {name}' to create one first, or pass --path."
-    entry = registry.add(name, path, tool)
+    try:
+        await ensure_fetched(plugin, plugin_entry)
+    except Exception as exc:
+        return f"Fetch failed: {exc}"
+    entry = registry.add(name, path, plugin)
     start_supervising(name)
-    return f"Added {name}: {entry['tool']} @ {entry['path']}, starting."
+    return f"Added {name}: {entry['plugin']} @ {entry['path']}, starting."
 
 
 def cmd_status(name: str) -> str:
@@ -237,7 +301,7 @@ def cmd_status(name: str) -> str:
         return f"No such project: {name}"
     live = "running" if name in _procs else ("supervised (starting/backoff)" if name in _supervisors else "stopped")
     return (
-        f"{name}\n  path: {entry['path']}\n  tool: {entry['tool']}\n"
+        f"{name}\n  path: {entry['path']}\n  plugin: {entry['plugin']}\n"
         f"  status: {entry['status']}\n  live: {live}"
     )
 
@@ -286,6 +350,41 @@ def cmd_log(n: int = 10) -> str:
     return "\n".join(lines) or "(no logs yet)"
 
 
+def cmd_catalog_list() -> str:
+    plugins = catalog.list_plugins()
+    if not plugins:
+        return "No plugins in catalog."
+    lines = []
+    for name, p in sorted(plugins.items()):
+        if p["kind"] == "builtin":
+            detail = f"backend={p['backend']}"
+        elif p["kind"] == "git":
+            detail = p["url"] + (f"@{p['ref']}" if p.get("ref") else "")
+        elif p["kind"] == "docker":
+            detail = p["image"]
+        else:
+            detail = "?"
+        desc = f" — {p['description']}" if p.get("description") else ""
+        lines.append(f"- {name} [{p['kind']}]: {detail}{desc}")
+    return "\n".join(lines)
+
+
+def cmd_catalog_add_git(name: str, url: str, ref: Optional[str] = None, description: str = "") -> str:
+    entry = catalog.add_git(name, url, ref, description)
+    return f"Catalog: {name} added ({entry['kind']}: {url})"
+
+
+def cmd_catalog_add_docker(name: str, image: str, description: str = "") -> str:
+    entry = catalog.add_docker(name, image, description)
+    return f"Catalog: {name} added ({entry['kind']}: {image})"
+
+
+def cmd_catalog_remove(name: str) -> str:
+    if not catalog.remove(name):
+        return f"No such plugin: {name}"
+    return f"Catalog: {name} removed."
+
+
 # ---------------------------------------------------------------------------
 # "controller <cmd> ..." exact-syntax dispatcher
 # ---------------------------------------------------------------------------
@@ -311,9 +410,11 @@ def _parse_args(rest: str) -> tuple[list[str], dict[str, str]]:
 
 
 HELP = (
-    "Commands: list | add <name> [--path P] [--tool claude|cursor] | "
+    "Commands: list | add <name> [--path P] [--plugin claude|cursor|...] | "
     "mkdir <name> [--root R] | paths [filter] | status <name> | "
-    "archive <name> | pause <name> | restore <name> | remove <name> [--wipe] | log [n]"
+    "archive <name> | pause <name> | restore <name> | remove <name> [--wipe] | log [n] | "
+    "catalog list | catalog add <name> --git URL [--ref R] [--desc D] | "
+    "catalog add <name> --docker IMAGE [--desc D] | catalog remove <name>"
 )
 
 
@@ -339,8 +440,26 @@ async def dispatch_command(text: str) -> Optional[str]:
         if cmd == "add":
             pos, flags = _parse_args(rest)
             if not pos:
-                return "usage: add <name> [--path P] [--tool claude|cursor]"
-            return cmd_add(pos[0], flags.get("path"), flags.get("tool", "claude"))
+                return "usage: add <name> [--path P] [--plugin claude|cursor|...]"
+            return await cmd_add(pos[0], flags.get("path"), flags.get("plugin", "claude"))
+        if cmd == "catalog":
+            sub, _, subrest = rest.strip().partition(" ")
+            pos, flags = _parse_args(subrest)
+            if sub == "list":
+                return cmd_catalog_list()
+            if sub == "add":
+                if not pos:
+                    return "usage: catalog add <name> --git URL [--ref R] | catalog add <name> --docker IMAGE"
+                if "git" in flags:
+                    return cmd_catalog_add_git(pos[0], flags["git"], flags.get("ref"), flags.get("desc", ""))
+                if "docker" in flags:
+                    return cmd_catalog_add_docker(pos[0], flags["docker"], flags.get("desc", ""))
+                return "usage: catalog add <name> --git URL | --docker IMAGE"
+            if sub == "remove":
+                if not pos:
+                    return "usage: catalog remove <name>"
+                return cmd_catalog_remove(pos[0])
+            return "usage: catalog list | catalog add <name> --git URL|--docker IMAGE | catalog remove <name>"
         if cmd == "status":
             pos, _ = _parse_args(rest)
             if not pos:
@@ -399,10 +518,12 @@ TOOLS = [
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
-        "name": "add_project", "description": "Register a project and start its session. Omit path to auto-search by name.",
+        "name": "add_project",
+        "description": "Register a project and start its session, using a plugin from the catalog "
+                        "(see list_catalog). Omit path to auto-search by name.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "path": {"type": "string"},
-            "tool": {"type": "string", "enum": ["claude", "cursor"]},
+            "plugin": {"type": "string", "description": "catalog plugin name, e.g. 'claude', 'cursor', or a custom one"},
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
@@ -423,24 +544,53 @@ TOOLS = [
             "name": {"type": "string"}, "wipe": {"type": "boolean"}
         }, "required": ["name"]},
     }},
+    {"type": "function", "function": {
+        "name": "list_catalog", "description": "List available plugins (claude, cursor, and any custom git/docker ones).",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "add_git_plugin",
+        "description": "Register a new plugin sourced from a git repo. The repo must contain main.py "
+                        "at its root implementing the same self-registering protocol as session_client.py.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "url": {"type": "string"},
+            "ref": {"type": "string"}, "description": {"type": "string"},
+        }, "required": ["name", "url"]},
+    }},
+    {"type": "function", "function": {
+        "name": "add_docker_plugin", "description": "Register a new plugin sourced from a docker image.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "image": {"type": "string"}, "description": {"type": "string"},
+        }, "required": ["name", "image"]},
+    }},
+    {"type": "function", "function": {
+        "name": "remove_plugin", "description": "Remove a plugin from the catalog.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
 ]
 
 _TOOL_IMPL = {
     "list_projects": lambda **kw: cmd_list(),
     "list_paths": lambda **kw: cmd_paths(kw.get("filter", "")),
     "mkdir": lambda **kw: cmd_mkdir(kw["name"], kw.get("root")),
-    "add_project": lambda **kw: cmd_add(kw["name"], kw.get("path"), kw.get("tool", "claude")),
+    "add_project": lambda **kw: cmd_add(kw["name"], kw.get("path"), kw.get("plugin", "claude")),
     "status": lambda **kw: cmd_status(kw["name"]),
     "archive_project": lambda **kw: cmd_archive(kw["name"]),
     "restore_project": lambda **kw: cmd_restore(kw["name"]),
     "remove_project": lambda **kw: cmd_remove(kw["name"], kw.get("wipe", False)),
+    "list_catalog": lambda **kw: cmd_catalog_list(),
+    "add_git_plugin": lambda **kw: cmd_catalog_add_git(kw["name"], kw["url"], kw.get("ref"), kw.get("description", "")),
+    "add_docker_plugin": lambda **kw: cmd_catalog_add_docker(kw["name"], kw["image"], kw.get("description", "")),
+    "remove_plugin": lambda **kw: cmd_catalog_remove(kw["name"]),
 }
 
 SYSTEM_PROMPT = (
     "You are the sijba agent controller. You manage coding-agent sessions, one per "
-    "project directory. Use the tools to inspect and mutate registered projects. "
-    "When creating a project whose exact path is unknown, call list_paths first; if "
-    "nothing matches, call mkdir, then add_project with the resulting path. Keep replies short."
+    "project directory, each backed by a plugin from the catalog (claude and cursor are "
+    "built in; call list_catalog to see custom git/docker ones). Use the tools to inspect "
+    "and mutate registered projects and the catalog. When creating a project whose exact "
+    "path is unknown, call list_paths first; if nothing matches, call mkdir, then "
+    "add_project with the resulting path. Keep replies short."
 )
 
 
