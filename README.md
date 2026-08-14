@@ -25,9 +25,10 @@ controller instead.
   [sijba-claude-plugin](https://REDACTED-GIT-HOST/sijba/sijba-claude-plugin)
   and [sijba-cursor-plugin](https://REDACTED-GIT-HOST/sijba/sijba-cursor-plugin)
   respectively. You can add your own `kind: git` (repo URL, cloned on first
-  use) or `kind: docker` (image, pulled on first use) plugins the same way.
-  Unlike `registry.json` this **is** committed — it's config (what's
-  possible), not local runtime state (what's currently running).
+  use), `kind: docker` (image, pulled on first use), or `kind: local` (a
+  locally-installed command, no fetch step) plugins the same way. Unlike
+  `registry.json` this **is** committed — it's config (what's possible),
+  not local runtime state (what's currently running).
 - **`registry.py`** — the shared JSON file both the controller and running
   plugin processes read/write (`registry.json`, gitignored — local machine
   state, not config).
@@ -60,6 +61,33 @@ A `kind: docker` entry just needs an image that honors the same contract;
 the controller runs it with `WORK_DIR` mounted at `/work` and
 `REGISTRY_FILE` mounted at `/registry.json` inside the container.
 
+### `kind: local` — plugins that don't speak the sijba protocol at all
+
+Not every useful process fits the "self-registers a sijba channel" contract
+above. `kind: local` is the escape hatch: just a command (`{name}`/
+`{work_dir}` placeholders filled in at spawn time), run in the project's
+directory, wrapped in `script -qc "..." /dev/null` so it always gets a real
+pty — some commands need one (an *interactive* session), and `script`'s own
+exit is tied to the wrapped command's, so crash-loop backoff still sees the
+right process lifetime either way.
+
+The seeded example is `remote-control`:
+
+```
+catalog list
+# remote-control [local]: claude --remote-control {name} — ...
+
+add my-project --plugin remote-control
+```
+
+This starts `claude --remote-control my-project` in `my-project`'s
+directory, supervised exactly like any other project (crash-loop backoff,
+`archive`/`pause`/`restore`/`remove` all work the normal way) — but there's
+**no sijba channel and no chat relay**: you talk to it by pairing the
+Claude mobile app to the named Remote Control session directly, same as
+you would from an interactive terminal. `controller status <name>` tells
+you it's running; the conversation itself happens entirely outside sijba.
+
 ## Chat commands (channel `controller`, trigger `controller ...`)
 
 ```
@@ -76,6 +104,7 @@ log [n]                                  controller's own last n log lines (defa
 catalog list                             available plugins
 catalog add <name> --git URL [--ref R]   register a git-sourced plugin
 catalog add <name> --docker IMAGE        register a docker-sourced plugin
+catalog add <name> --local "cmd"         register a local-command plugin
 catalog remove <name>                    remove a plugin from the catalog
 ```
 

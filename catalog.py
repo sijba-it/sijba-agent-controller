@@ -23,7 +23,7 @@ CATALOG_FILE = Path(os.environ.get("CATALOG_FILE", Path(__file__).parent / "cata
 # here — gitignored, same reasoning as registry.json.
 PLUGINS_DIR = Path(os.environ.get("PLUGINS_DIR", Path(__file__).parent / "_plugins"))
 
-KINDS = {"git", "docker"}
+KINDS = {"git", "docker", "local"}
 
 _GITEA = "ssh://git@REDACTED-GIT-HOST:7999/sijba"
 
@@ -37,6 +37,14 @@ def _default_data() -> dict:
         "cursor": {
             "kind": "git", "url": f"{_GITEA}/sijba-cursor-plugin.git", "ref": None,
             "description": "Cursor Agent CLI, one-shot turns via --resume",
+        },
+        "remote-control": {
+            "kind": "local", "command": ["claude", "--remote-control", "{name}"],
+            "description": (
+                "Interactive Claude Code session paired to the Claude mobile app via "
+                "Remote Control. No sijba chat relay — talk to it from your phone, not "
+                "from a sijba channel; the controller only keeps the session alive."
+            ),
         },
     }
 
@@ -87,6 +95,12 @@ def add_git(name: str, url: str, ref: Optional[str] = None, description: str = "
 
 def add_docker(name: str, image: str, description: str = "") -> dict:
     return _add(name, {"kind": "docker", "image": image, "description": description})
+
+
+def add_local(name: str, command: list[str], description: str = "") -> dict:
+    """A plugin that's just a local command — no fetch step. `command` may
+    use `{name}`/`{work_dir}` placeholders, filled in at spawn time."""
+    return _add(name, {"kind": "local", "command": command, "description": description})
 
 
 def remove(name: str) -> bool:

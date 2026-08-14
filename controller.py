@@ -132,12 +132,13 @@ async def ensure_fetched(plugin_name: str, plugin: dict) -> None:
             raise RuntimeError(f"docker pull failed for {plugin_name!r} (exit {code})")
 
 
-def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dict]:
-    """Build (argv, env) for this project, dispatched on its plugin's kind."""
+def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dict, str]:
+    """Build (argv, env, cwd) for this project, dispatched on its plugin's kind."""
     env = _spawn_env(name, entry)
+    controller_dir = str(Path(__file__).parent)
     if plugin["kind"] == "git":
         entry_point = catalog.PLUGINS_DIR / entry["plugin"] / "main.py"
-        return [PYTHON, str(entry_point)], env
+        return [PYTHON, str(entry_point)], env, controller_dir
     if plugin["kind"] == "docker":
         cmd = [
             "docker", "run", "--rm", "--name", f"sijba-{name}",
@@ -149,7 +150,18 @@ def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dic
             plugin["image"],
         ]
         # Env vars for a container go via -e above, not the docker CLI's own env.
-        return cmd, dict(os.environ)
+        return cmd, dict(os.environ), controller_dir
+    if plugin["kind"] == "local":
+        # No fetch step — just a locally-installed command, run in the
+        # project's own directory. Not every local command needs a real
+        # terminal, but some do (e.g. `claude --remote-control` explicitly
+        # wants an *interactive* session) — `script -qc` allocates a pty
+        # unconditionally so both cases work, and — importantly for
+        # supervision — script's own exit is tied to the wrapped command's
+        # exit, so crash-loop backoff still sees the right lifetime.
+        argv = [part.format(name=name, work_dir=entry["path"]) for part in plugin["command"]]
+        wrapped = " ".join(shlex.quote(a) for a in argv)
+        return ["script", "-qc", wrapped, "/dev/null"], env, entry["path"]
     raise RuntimeError(f"unknown plugin kind {plugin['kind']!r}")
 
 
@@ -157,10 +169,10 @@ async def _spawn(name: str, entry: dict) -> asyncio.subprocess.Process:
     plugin = catalog.get(entry["plugin"])
     if plugin is None:
         raise RuntimeError(f"catalog has no plugin {entry['plugin']!r}")
-    argv, env = _spawn_command(name, entry, plugin)
+    argv, env, cwd = _spawn_command(name, entry, plugin)
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        cwd=str(Path(__file__).parent),
+        cwd=cwd,
         env=env,
         # Inherit stdout/stderr — one combined journal stream, each line
         # already prefixed with the project name by the plugin's own _log().
@@ -359,6 +371,8 @@ def cmd_catalog_list() -> str:
             detail = p["url"] + (f"@{p['ref']}" if p.get("ref") else "")
         elif p["kind"] == "docker":
             detail = p["image"]
+        elif p["kind"] == "local":
+            detail = " ".join(p["command"])
         else:
             detail = "?"
         desc = f" — {p['description']}" if p.get("description") else ""
@@ -374,6 +388,12 @@ def cmd_catalog_add_git(name: str, url: str, ref: Optional[str] = None, descript
 def cmd_catalog_add_docker(name: str, image: str, description: str = "") -> str:
     entry = catalog.add_docker(name, image, description)
     return f"Catalog: {name} added ({entry['kind']}: {image})"
+
+
+def cmd_catalog_add_local(name: str, command: str, description: str = "") -> str:
+    argv = shlex.split(command)
+    entry = catalog.add_local(name, argv, description)
+    return f"Catalog: {name} added ({entry['kind']}: {' '.join(argv)})"
 
 
 def cmd_catalog_remove(name: str) -> str:
@@ -411,7 +431,8 @@ HELP = (
     "mkdir <name> [--root R] | paths [filter] | status <name> | "
     "archive <name> | pause <name> | restore <name> | remove <name> [--wipe] | log [n] | "
     "catalog list | catalog add <name> --git URL [--ref R] [--desc D] | "
-    "catalog add <name> --docker IMAGE [--desc D] | catalog remove <name>"
+    "catalog add <name> --docker IMAGE [--desc D] | "
+    "catalog add <name> --local \"cmd {name} {work_dir}\" [--desc D] | catalog remove <name>"
 )
 
 
@@ -451,7 +472,9 @@ async def dispatch_command(text: str) -> Optional[str]:
                     return cmd_catalog_add_git(pos[0], flags["git"], flags.get("ref"), flags.get("desc", ""))
                 if "docker" in flags:
                     return cmd_catalog_add_docker(pos[0], flags["docker"], flags.get("desc", ""))
-                return "usage: catalog add <name> --git URL | --docker IMAGE"
+                if "local" in flags:
+                    return cmd_catalog_add_local(pos[0], flags["local"], flags.get("desc", ""))
+                return "usage: catalog add <name> --git URL | --docker IMAGE | --local \"cmd\""
             if sub == "remove":
                 if not pos:
                     return "usage: catalog remove <name>"
@@ -561,6 +584,15 @@ TOOLS = [
         }, "required": ["name", "image"]},
     }},
     {"type": "function", "function": {
+        "name": "add_local_plugin",
+        "description": "Register a new plugin that's just a locally-installed command, no fetch step "
+                        "(e.g. `claude --remote-control {name}`). Runs in the project's own directory. "
+                        "{name} and {work_dir} placeholders are substituted at start time.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "command": {"type": "string"}, "description": {"type": "string"},
+        }, "required": ["name", "command"]},
+    }},
+    {"type": "function", "function": {
         "name": "remove_plugin", "description": "Remove a plugin from the catalog.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
     }},
@@ -578,6 +610,7 @@ _TOOL_IMPL = {
     "list_catalog": lambda **kw: cmd_catalog_list(),
     "add_git_plugin": lambda **kw: cmd_catalog_add_git(kw["name"], kw["url"], kw.get("ref"), kw.get("description", "")),
     "add_docker_plugin": lambda **kw: cmd_catalog_add_docker(kw["name"], kw["image"], kw.get("description", "")),
+    "add_local_plugin": lambda **kw: cmd_catalog_add_local(kw["name"], kw["command"], kw.get("description", "")),
     "remove_plugin": lambda **kw: cmd_catalog_remove(kw["name"]),
 }
 
