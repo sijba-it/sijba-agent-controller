@@ -153,15 +153,25 @@ def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dic
         return cmd, dict(os.environ), controller_dir
     if plugin["kind"] == "local":
         # No fetch step — just a locally-installed command, run in the
-        # project's own directory. Not every local command needs a real
-        # terminal, but some do (e.g. `claude --remote-control` explicitly
-        # wants an *interactive* session) — `script -qc` allocates a pty
-        # unconditionally so both cases work, and — importantly for
-        # supervision — script's own exit is tied to the wrapped command's
-        # exit, so crash-loop backoff still sees the right lifetime.
+        # project's own directory, inside a named tmux session rather than
+        # a bare pty: some commands need a real terminal (e.g. `claude
+        # --remote-control` explicitly wants an *interactive* session), and
+        # wrapping in tmux means a human can also `tmux attach -t
+        # sijba-<name>` later, not just watch via whatever the command
+        # itself pairs with. `-A` creates-or-attaches, so a restart after a
+        # crash reattaches to a stray session instead of erroring. tmux
+        # still needs *something* that looks like a terminal to attach
+        # from and we have none (headless service) — `script -qc` fakes
+        # one. Either way script's own exit stays tied to the session's
+        # actual lifetime, so crash-loop backoff still sees it right.
         argv = [part.format(name=name, work_dir=entry["path"]) for part in plugin["command"]]
-        wrapped = " ".join(shlex.quote(a) for a in argv)
-        return ["script", "-qc", wrapped, "/dev/null"], env, entry["path"]
+        session_name = f"sijba-{name}"
+        inner = " ".join(shlex.quote(a) for a in argv)
+        tmux_cmd = (
+            f"tmux new-session -A -s {shlex.quote(session_name)} "
+            f"-c {shlex.quote(entry['path'])} {inner}"
+        )
+        return ["script", "-qc", tmux_cmd, "/dev/null"], env, entry["path"]
     raise RuntimeError(f"unknown plugin kind {plugin['kind']!r}")
 
 
@@ -170,12 +180,21 @@ async def _spawn(name: str, entry: dict) -> asyncio.subprocess.Process:
     if plugin is None:
         raise RuntimeError(f"catalog has no plugin {entry['plugin']!r}")
     argv, env, cwd = _spawn_command(name, entry, plugin)
+    # kind:local wraps a full-screen terminal UI (tmux) — its raw ANSI
+    # screen redraws are noise in the shared journal, not useful for
+    # troubleshooting. The actual interaction happens via `tmux attach` or
+    # whatever the command itself pairs with, not here.
+    quiet = plugin["kind"] == "local"
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
         env=env,
-        # Inherit stdout/stderr — one combined journal stream, each line
-        # already prefixed with the project name by the plugin's own _log().
+        # git/docker plugins inherit stdout/stderr (None) — one combined
+        # journal stream, each line already prefixed with the project name
+        # by the plugin's own _log(). kind:local gets DEVNULL instead, see
+        # `quiet` above.
+        stdout=asyncio.subprocess.DEVNULL if quiet else None,
+        stderr=asyncio.subprocess.DEVNULL if quiet else None,
     )
     _procs[name] = proc
     _log(f"{name}: started (pid={proc.pid}, plugin={entry['plugin']})")
