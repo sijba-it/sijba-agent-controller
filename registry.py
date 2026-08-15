@@ -15,6 +15,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,13 +25,15 @@ import catalog
 
 REGISTRY_FILE = Path(os.environ.get("REGISTRY_FILE", Path(__file__).parent / "registry.json"))
 
-# Comma-separated list of "<org>" root directories under which `paths`/`mkdir`
-# search/create by default, e.g. "/home/rbartl/workspaces/sijba,/home/rbartl/workspaces/edvbartl".
-# A list (not one hardcoded path) because the real layout is ~/workspaces/<org>/<project>/,
-# with sijba being just one org among several (edvbartl, hocoas, ...).
+# Comma-separated list of workspace root directories `paths` searches (two
+# levels deep — see search_paths) and `mkdir` creates under, e.g.
+# "/home/rbartl/workspaces,/mnt/otherdrive/projects". Default is the single
+# top-level ~/workspaces — the real layout is ~/workspaces/<org>/<project>/,
+# with many orgs underneath (sijba, edvbartl, hocoas, ...), so searching two
+# levels down from one root covers all of them without listing each org.
 DEFAULT_ROOTS = [
     p.strip() for p in os.environ.get(
-        "WORKSPACE_ROOTS", str(Path.home() / "workspaces" / "sijba")
+        "WORKSPACE_ROOTS", str(Path.home() / "workspaces")
     ).split(",") if p.strip()
 ]
 
@@ -118,19 +121,32 @@ def roots() -> list[str]:
 
 
 def search_paths(filter_str: str = "") -> list[str]:
-    """Case-insensitive substring search for immediate subdirectories of each
-    configured root. One level deep only — matches the ~/workspaces/<org>/<project>
-    layout, not arbitrary nesting."""
+    """Case-insensitive substring search, two levels deep under each
+    configured root — matches the ~/workspaces/<org>/<project> layout (org
+    at depth 1, project at depth 2), so one root covers every org without
+    listing each one. Matches against the "<org>/<project>" relative path,
+    so searching by org name or project name both work."""
     needle = filter_str.lower()
     hits: list[str] = []
     for root in roots():
         root_path = Path(root)
         if not root_path.is_dir():
             continue
-        for child in sorted(root_path.iterdir()):
-            if child.is_dir() and not child.name.startswith(".") and needle in child.name.lower():
-                hits.append(str(child))
-    return hits
+        try:
+            proc = subprocess.run(
+                ["find", str(root_path), "-mindepth", "2", "-maxdepth", "2", "-type", "d"],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in proc.stdout.splitlines():
+            path = Path(line)
+            rel = path.relative_to(root_path)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            if needle in str(rel).lower():
+                hits.append(str(path))
+    return sorted(hits)
 
 
 def mkdir(name: str, root: Optional[str] = None) -> str:
