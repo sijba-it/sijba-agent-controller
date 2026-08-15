@@ -263,9 +263,24 @@ async def stop_process(name: str, reason: str) -> None:
             await asyncio.wait_for(proc.wait(), timeout=10)
         except asyncio.TimeoutError:
             proc.kill()
-    else:
-        # Nothing running (e.g. mid-backoff-sleep) — nothing to terminate,
-        # but the supervisor loop will see the flag on its next spin.
+    # else: nothing in _procs (e.g. mid-backoff-sleep) — nothing to
+    # terminate there, but the supervisor loop will see the flag on its
+    # next spin.
+
+    # kind:local wraps its command in a named tmux session (see
+    # _spawn_command) so it survives detach and is attachable independently
+    # — but that means killing the client above (the `script`-wrapped tmux
+    # attach we actually hold a handle to) only detaches it. The session,
+    # and whatever's still running inside it, persists on the tmux server
+    # until explicitly killed. Harmless no-op for git/docker plugins, which
+    # never created a session with this name.
+    try:
+        kill_proc = await asyncio.create_subprocess_exec(
+            "tmux", "kill-session", "-t", f"sijba-{name}",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await kill_proc.wait()
+    except FileNotFoundError:
         pass
 
 
