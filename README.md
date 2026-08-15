@@ -117,7 +117,10 @@ catalog remove <name>                    remove a plugin from the catalog
 
 Per-project channel (`<plugin>:<name>`, trigger `<name> ...`): plain text
 goes to the agent; `/archive`, `/pause`, `/log [n]` are handled locally the
-same way, scoped to that one project.
+same way, scoped to that one project. The `claude` and `cursor` plugins
+additionally support `/reset` — restarts the underlying session with no
+prior conversation context (not part of the general plugin contract, just
+something those two happen to implement).
 
 Free text that doesn't match the exact syntax above falls back to an
 optional LLM tool-calling turn (OpenRouter-style, same env vars as
