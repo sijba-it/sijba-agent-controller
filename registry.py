@@ -150,8 +150,11 @@ def search_paths(filter_str: str = "") -> list[str]:
 
 
 def mkdir(name: str, root: Optional[str] = None) -> str:
-    """Create <root>/<name> (default root = first configured root). Errors
-    if it already exists — this only ever creates brand-new project dirs."""
+    """Create <root>/<name>. If an org is given via --root, honor it —
+    otherwise fall back to the first configured workspace root (today just
+    ~/workspaces), landing the new project at the top level rather than
+    guessing which org it belongs to. Errors if it already exists — this
+    only ever creates brand-new project dirs."""
     base = Path(root) if root else Path(roots()[0])
     target = base / name
     if target.exists():
