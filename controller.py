@@ -665,14 +665,26 @@ def _post(url: str, payload: dict, extra_headers: dict = None) -> dict:
         return json.loads(r.read())
 
 
+# Conversation memory for the LLM layer, across separate incoming chat
+# messages (not just within one turn's tool-calling rounds). Without this,
+# a clarifying follow-up ("edvbartl/zahnrad" after being asked for a path)
+# arrives with zero context connecting it to what was actually being asked
+# — the model has no way to know it's an answer to its own question.
+# Global, not per-channel: there's only ever one "controller" channel today.
+# Holds plain user/assistant turns only (not the tool-call scaffolding a
+# single turn generates internally) to stay compact.
+_llm_history: list[dict] = []
+LLM_HISTORY_TURNS = 20  # ~10 back-and-forths
+
+
 async def run_llm_turn(user_text: str) -> str:
     if not LLM_API_KEY:
         return f"Unrecognized command. {HELP}"
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_text},
-    ]
+    _llm_history.append({"role": "user", "content": user_text})
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _llm_history[-LLM_HISTORY_TURNS:]
+
+    final_reply = "Gave up after 5 tool-call rounds."
     loop = asyncio.get_event_loop()
     for _ in range(5):
         try:
@@ -682,14 +694,17 @@ async def run_llm_turn(user_text: str) -> str:
                                {"model": LLM_MODEL, "messages": messages, "tools": TOOLS, "temperature": 0.2}),
             )
         except urllib.error.HTTPError as exc:
-            return f"LLM error: HTTP {exc.code}"
+            final_reply = f"LLM error: HTTP {exc.code}"
+            break
         except Exception as exc:
-            return f"LLM error: {exc}"
+            final_reply = f"LLM error: {exc}"
+            break
 
         msg = resp["choices"][0]["message"]
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
-            return msg.get("content") or "(no reply)"
+            final_reply = msg.get("content") or "(no reply)"
+            break
 
         messages.append(msg)
         for tc in tool_calls:
@@ -710,7 +725,9 @@ async def run_llm_turn(user_text: str) -> str:
             _log(f"llm tool_call {fn_name}({fn_args}) -> {str(result)[:200]!r}")
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
 
-    return "Gave up after 5 tool-call rounds."
+    _llm_history.append({"role": "assistant", "content": final_reply})
+    del _llm_history[:-LLM_HISTORY_TURNS]
+    return final_reply
 
 
 # ---------------------------------------------------------------------------
