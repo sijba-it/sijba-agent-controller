@@ -41,7 +41,7 @@ STATUSES = {"active", "archived", "paused"}
 
 
 def _default_data() -> dict:
-    return {"roots": list(DEFAULT_ROOTS), "projects": {}}
+    return {"projects": {}}
 
 
 @contextmanager
@@ -117,7 +117,14 @@ def remove(name: str) -> bool:
 
 
 def roots() -> list[str]:
-    return load()["roots"]
+    """Search/mkdir roots — always live from WORKSPACE_ROOTS, never stored
+    state. Previously this was persisted into registry.json at first
+    creation and never touched again, since nothing ever actually mutates
+    it — which meant changing WORKSPACE_ROOTS had *no effect* on an
+    existing registry.json: found live, search kept using a stale root
+    from the very first time the file was created, no matter what the env
+    var said on every restart since."""
+    return DEFAULT_ROOTS
 
 
 def search_paths(filter_str: str = "") -> list[str]:
