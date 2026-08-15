@@ -319,6 +319,32 @@ def cmd_mkdir(name: str, root: Optional[str] = None) -> str:
     return f"Created {path}"
 
 
+CLAUDE_CONFIG_FILE = Path.home() / ".claude.json"
+
+
+def _trust_claude_dir(path: str) -> None:
+    """Pre-accept Claude Code's interactive workspace-trust dialog for a
+    project directory. Only matters for plugins that run an actual
+    interactive `claude` session (kind:local, e.g. remote-control) — unlike
+    -p/headless mode, that dialog isn't auto-skipped there, and our
+    tmux-wrapped process has nothing attached to answer an interactive
+    prompt with. Harmless no-op for projects that never invoke claude.
+    Best-effort: touches ~/.claude.json, which the real claude CLI also
+    writes to, so a lost race just means the dialog appears once — not
+    worth adding locking for."""
+    if not CLAUDE_CONFIG_FILE.exists():
+        return
+    try:
+        data = json.loads(CLAUDE_CONFIG_FILE.read_text())
+        entry = data.setdefault("projects", {}).setdefault(path, {})
+        entry["hasTrustDialogAccepted"] = True
+        tmp = CLAUDE_CONFIG_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, CLAUDE_CONFIG_FILE)
+    except (json.JSONDecodeError, OSError) as exc:
+        _log(f"_trust_claude_dir({path}): {exc}")
+
+
 async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "claude") -> str:
     plugin_entry = catalog.get(plugin)
     if plugin_entry is None:
@@ -335,6 +361,7 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "claude")
         await ensure_fetched(plugin, plugin_entry)
     except Exception as exc:
         return f"Fetch failed: {exc}"
+    _trust_claude_dir(path)
     entry = registry.add(name, path, plugin)
     start_supervising(name)
     return f"Added {name}: {entry['plugin']} @ {entry['path']}, starting."
