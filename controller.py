@@ -690,7 +690,12 @@ SYSTEM_PROMPT = (
     "project by name, say you couldn't find it and ask for the path instead of "
     "silently creating an empty directory. "
     "Keep the project name exactly as the user gave it — never split a multi-word "
-    "name across the search filter and the registered project name. "
+    "name across the search filter and the registered project name. If they don't "
+    "give a name at all, derive one from the target directory's own name (e.g. "
+    "'/home/x/Obsidian' -> 'obsidian') — never default to the plugin's name (e.g. "
+    "'cursor' or 'claude'), that collides with the plugin identifier itself and "
+    "makes the project ambiguous to refer to later, especially once more than one "
+    "project uses the same plugin. "
     "Keep replies short."
 )
 
