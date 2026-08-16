@@ -653,10 +653,17 @@ TOOLS = [
             "name": {"type": "string"}, "command": {"type": "string"}, "description": {"type": "string"},
         }, "required": ["name", "command"]},
     }},
-    {"type": "function", "function": {
-        "name": "remove_plugin", "description": "Remove a plugin from the catalog.",
-        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
-    }},
+    # No remove_plugin here on purpose — see cmd_catalog_remove. Deleting a
+    # catalog entry is shared, high-blast-radius state (breaks every future
+    # add_project for that plugin, for every project, not just one), unlike
+    # remove_project which only ever touches one project's own registry
+    # entry. Found live: asked to clean up a badly-named *project* called
+    # "cursor", the model called remove_plugin("cursor") instead of
+    # remove_project("cursor") — deleting the whole cursor catalog entry
+    # and silently breaking every subsequent cursor-agent request until a
+    # human noticed something was off and it got manually restored. Catalog
+    # removal now requires the exact "controller catalog remove <name>"
+    # command, typed by a human on purpose.
 ]
 
 _TOOL_IMPL = {
@@ -672,7 +679,6 @@ _TOOL_IMPL = {
     "add_git_plugin": lambda **kw: cmd_catalog_add_git(kw["name"], kw["url"], kw.get("ref"), kw.get("description", "")),
     "add_docker_plugin": lambda **kw: cmd_catalog_add_docker(kw["name"], kw["image"], kw.get("description", "")),
     "add_local_plugin": lambda **kw: cmd_catalog_add_local(kw["name"], kw["command"], kw.get("description", "")),
-    "remove_plugin": lambda **kw: cmd_catalog_remove(kw["name"]),
 }
 
 SYSTEM_PROMPT = (
@@ -696,6 +702,11 @@ SYSTEM_PROMPT = (
     "'cursor' or 'claude'), that collides with the plugin identifier itself and "
     "makes the project ambiguous to refer to later, especially once more than one "
     "project uses the same plugin. "
+    "A project (registry) and a plugin (catalog) are different things, even when "
+    "they share a name — e.g. project 'cursor' vs the catalog's 'cursor' plugin. "
+    "*_project tools only ever affect that one project. If a project happens to be "
+    "named the same as a plugin, that is never a reason to touch the catalog — you "
+    "have no catalog-removal tool at all, on purpose. "
     "Keep replies short."
 )
 
