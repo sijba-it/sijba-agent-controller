@@ -231,8 +231,16 @@ async def ensure_running(name: str) -> None:
         try:
             proc = await _spawn(name, entry)
             code = await proc.wait()
-        except FileNotFoundError as exc:
-            _log(f"{name}: failed to spawn: {exc}")
+        except Exception as exc:
+            # Anything unexpected here — not just ENOENT — must still fall
+            # through to the crash-bucket backoff-and-retry below. This was
+            # previously scoped to just FileNotFoundError, so any other
+            # exception (a bad env var, a transient OSError, ...) fell
+            # through the bottom of the try without setting `code`, killing
+            # this supervisor asyncio.Task outright with no log line and no
+            # respawn — found live: a project's supervisor task vanished
+            # silently mid-session with nothing in the log to show why.
+            _log(f"{name}: failed to spawn/run: {exc!r}")
             code = None
         finally:
             _procs.pop(name, None)
