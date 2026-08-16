@@ -89,8 +89,12 @@ def add(name: str, path: str, plugin: str) -> dict:
     if catalog.get(plugin) is None:
         raise ValueError(f"unknown plugin {plugin!r} — see 'catalog list'")
     with _locked() as data:
-        if name in data["projects"]:
-            raise ValueError(f"project {name!r} already registered")
+        existing = data["projects"].get(name)
+        if existing is not None:
+            raise ValueError(
+                f"project {name!r} already registered (status: {existing['status']}) — "
+                f"remove it first, or restore it if you want the original plugin/path back"
+            )
         entry = {
             "path": str(path),
             "plugin": plugin,

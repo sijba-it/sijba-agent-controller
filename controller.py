@@ -82,6 +82,21 @@ def _log(msg: str) -> None:
     print(line, flush=True)
 
 
+def _age(ts: float) -> str:
+    """Human-readable age of a unix timestamp, e.g. "3h ago" — used to show
+    when a project's status last changed, so a stale archived entry (which
+    silently blocks re-adding under the same name) is visible instead of
+    just sitting there invisibly."""
+    delta = time.time() - ts
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
 # ---------------------------------------------------------------------------
 # Process supervision
 # ---------------------------------------------------------------------------
@@ -303,7 +318,9 @@ def cmd_list() -> str:
     lines = []
     for name, e in sorted(projects.items()):
         live = "running" if name in _procs else ("supervised" if name in _supervisors else "-")
-        lines.append(f"- {name}: {e['plugin']} @ {e['path']} [{e['status']}/{live}]")
+        since = e.get("status_changed_at") or e.get("created_at")
+        age = f", {_age(since)}" if since else ""
+        lines.append(f"- {name}: {e['plugin']} @ {e['path']} [{e['status']}/{live}{age}]")
     return "\n".join(lines)
 
 
@@ -372,9 +389,11 @@ def cmd_status(name: str) -> str:
     if entry is None:
         return f"No such project: {name}"
     live = "running" if name in _procs else ("supervised (starting/backoff)" if name in _supervisors else "stopped")
+    created = f" (created {_age(entry['created_at'])})" if entry.get("created_at") else ""
+    changed = f" ({_age(entry['status_changed_at'])})" if entry.get("status_changed_at") else ""
     return (
         f"{name}\n  path: {entry['path']}\n  plugin: {entry['plugin']}\n"
-        f"  status: {entry['status']}\n  live: {live}"
+        f"  status: {entry['status']}{changed}\n  live: {live}{created}"
     )
 
 
