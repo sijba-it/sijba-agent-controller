@@ -138,9 +138,18 @@ pip install websockets
 export SIJBA_URL=https://sijba.edv-bartl.at
 export SIJBA_TOKEN=your-token-here
 export WORKSPACE_ROOTS=/home/robert/workspaces/sijba   # comma-separated for multiple orgs
+# export CONTROLLER_NAME=controller-prod   # only if the default (controller-<hostname>) is ugly
 
 python controller.py
 ```
+
+Defaults to `controller-<hostname>` for `plugin_id`/`channel_id`/chat trigger, so
+running one controller per host (the common case) just works without every
+instance fighting over the same channel name — the last one to register a
+given `channel_id` wins server-side, so two hosts both registering plain
+`controller` silently steal the channel from each other. Set `CONTROLLER_NAME`
+to override the whole name (e.g. for a friendlier trigger word than the raw
+hostname).
 
 ## systemd
 

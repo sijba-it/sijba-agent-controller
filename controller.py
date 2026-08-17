@@ -35,6 +35,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import sys
 import time
 import urllib.error
@@ -55,9 +56,39 @@ from exit_codes import EXIT_ARCHIVED, EXIT_PAUSED
 
 SIJBA_URL = os.environ.get("SIJBA_URL", "wss://sijba.edv-bartl.at")
 SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
-PLUGIN_ID = os.environ.get("PLUGIN_ID", "controller")
-CHANNEL_ID = "controller"
+# Running one controller per host means each needs its own
+# plugin_id/channel_id/trigger, or the sijba server can't tell them apart
+# (last one to register a given channel_id wins) — so the default already
+# bakes in the short hostname rather than a bare "controller" that only
+# works for a single-host setup. Override CONTROLLER_NAME directly for a
+# friendlier trigger word (e.g. "controller-prod") if the hostname is ugly.
+CONTROLLER_NAME = os.environ.get("CONTROLLER_NAME") or f"controller-{socket.gethostname().split('.')[0]}"
+PLUGIN_ID = os.environ.get("PLUGIN_ID", CONTROLLER_NAME)
+CHANNEL_ID = CONTROLLER_NAME
 PYTHON = sys.executable
+
+
+def _load_claude_plugin_api_key() -> str:
+    """Loaded from a dedicated file, deliberately never the controller's own
+    os.environ — _spawn_env below does env = dict(os.environ) for every
+    plugin kind, so anything sitting in the controller's own environment
+    reaches every spawned child, remote-control included. That plugin is a
+    real interactive session tied to the Pro/Max subscription's OAuth login
+    (`claude --remote-control`, driven from the phone app — see catalog.json);
+    an ANTHROPIC_API_KEY leaking into it would silently switch it to
+    per-token API billing instead. Reading from a file _spawn_env injects
+    only for the 'claude' plugin keeps this key out of os.environ entirely,
+    so there's nothing for the blanket inherit to pick up."""
+    path = Path(os.environ.get(
+        "CLAUDE_PLUGIN_API_KEY_FILE", str(Path.home() / ".config" / "sijba-claude-plugin-api-key"),
+    ))
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return ""
+
+
+CLAUDE_PLUGIN_API_KEY = _load_claude_plugin_api_key()
 
 BACKOFF_BASE = 5.0
 BACKOFF_MAX = 300.0
@@ -116,6 +147,15 @@ def _spawn_env(name: str, entry: dict) -> dict:
         "WORK_DIR": entry["path"],
         "REGISTRY_FILE": str(registry.REGISTRY_FILE),
     })
+    # kind:local wraps its command in tmux inside a `script`-provided pty
+    # (see _spawn_command) — tmux's client needs $TERM to look up a
+    # terminfo entry to even initialize, and a controller with no
+    # controlling terminal of its own (e.g. run under systemd, unlike an
+    # ad-hoc shell launch that happens to inherit one) has no TERM at all.
+    # Without this, tmux fails silently (stdout/stderr are DEVNULL'd for
+    # this kind) with "open terminal failed: terminal does not support
+    # clear" and the whole thing crash-loops forever on exit=0.
+    env.setdefault("TERM", "xterm-256color")
     return env
 
 
@@ -268,6 +308,27 @@ async def ensure_running(name: str) -> None:
         await asyncio.sleep(backoff)
 
 
+async def terminate_all_children() -> None:
+    """Stop every process this controller currently supervises, called on
+    clean shutdown. Deliberately does NOT touch tmux sessions kind:local
+    processes run inside (only the `script`/`tmux attach` wrapper client
+    dies) — those persist on the tmux server and the next controller's `-A`
+    reattaches. Without this, a restarted controller has no record of the
+    previous instance's children, so they're never terminated: found live,
+    two `cursor`-kind subprocesses (each holding its own websocket
+    connection, so each still handling messages) were left running as
+    orphans for a full day after a routine restart, double-replying on
+    their channels the whole time."""
+    procs = [p for p in _procs.values() if p.returncode is None]
+    for proc in procs:
+        proc.terminate()
+    for proc in procs:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+
+
 def start_supervising(name: str) -> None:
     if name in _supervisors:
         return
@@ -382,6 +443,26 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "claude")
             return "Multiple matches, be specific with --path:\n" + "\n".join(hits)
         else:
             return f"No directory found for {name!r}. Use 'mkdir {name}' to create one first, or pass --path."
+    elif not Path(path).expanduser().is_dir():
+        # A bare name mistaken for an explicit path (e.g. the LLM tool-call
+        # reading "in dem verzeichnis X" as "path=X" instead of "name=X" to
+        # search for) would otherwise register a project whose cwd doesn't
+        # exist — it can never spawn, so it crash-loops on FileNotFoundError
+        # forever with nothing surfaced beyond the log. Found live: exactly
+        # this, for 'aiaccountant-export'. Fall back to the same search
+        # add(path=None) does, so a plain name still resolves; only error
+        # out if that search also can't find it.
+        hits = registry.search_paths(path)
+        if len(hits) == 1:
+            path = hits[0]
+        elif len(hits) > 1:
+            return f"{path!r} is not a directory. Multiple name matches, be specific with --path:\n" + "\n".join(hits)
+        else:
+            return (
+                f"{path!r} is not a directory (checked as given, and searched by that "
+                f"name under {registry.roots()}). Use 'mkdir {name}' to create one first, "
+                f"or pass a valid --path."
+            )
     try:
         await ensure_fetched(plugin, plugin_entry)
     except Exception as exc:
@@ -846,11 +927,12 @@ class ControllerClient:
             "capabilities": ["conversation", "tools"],
             "channels": {
                 CHANNEL_ID: {
-                    "label": "Agent Controller",
+                    "label": "Agent Controller" if CONTROLLER_NAME == "controller"
+                             else f"Agent Controller ({CONTROLLER_NAME})",
                     "hint": (
-                        "Manage per-project coding-agent sessions. Trigger: 'controller ...'. " + HELP
+                        f"Manage per-project coding-agent sessions. Trigger: '{CONTROLLER_NAME} ...'. " + HELP
                     ),
-                    "triggers": ["controller", "@controller"],
+                    "triggers": [CONTROLLER_NAME, f"@{CONTROLLER_NAME}"],
                     "capabilities": ["admin"],
                     "metadata": {},
                 }
@@ -885,7 +967,7 @@ class ControllerClient:
         envelope_id = payload["envelope_id"]
         text = payload["text"]
 
-        for trigger in ("controller", "@controller"):
+        for trigger in (CONTROLLER_NAME, f"@{CONTROLLER_NAME}"):
             if text.lower().startswith(trigger):
                 text = text[len(trigger):].strip()
                 break
@@ -926,6 +1008,7 @@ class ControllerClient:
                 pass
             self._reconnect_backoff = min(self._reconnect_backoff * 2, 300)
 
+        await terminate_all_children()
         _log("Shutdown complete")
 
 

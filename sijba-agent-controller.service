@@ -9,6 +9,9 @@ WorkingDirectory=/home/robert/sijba-agent-controller
 Environment=SIJBA_URL=https://sijba.edv-bartl.at
 Environment=SIJBA_TOKEN=your-token-here
 Environment=WORKSPACE_ROOTS=/home/robert/workspaces/sijba
+# Defaults to controller-<hostname> if unset — only needed for a nicer
+# trigger word, or if two hosts happen to share a hostname.
+#Environment=CONTROLLER_NAME=controller-prod
 # Optional: enable free-text control via LLM tool-calling (OpenRouter).
 # Leave unset to require exact "controller <cmd> ..." syntax.
 #Environment=LLM_API_URL=https://openrouter.ai/api/v1

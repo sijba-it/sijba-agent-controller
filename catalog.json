@@ -1,0 +1,29 @@
+{
+  "claude": {
+    "description": "Claude Code CLI, persistent session",
+    "kind": "git",
+    "ref": null,
+    "url": "ssh://git@REDACTED-GIT-HOST:7999/sijba/sijba-claude-plugin.git"
+  },
+  "cursor": {
+    "added_at": 1786864378.6410522,
+    "description": "Cursor Agent CLI, one-shot turns via --resume",
+    "kind": "git",
+    "ref": null,
+    "url": "ssh://git@REDACTED-GIT-HOST:7999/sijba/sijba-cursor-plugin.git"
+  },
+  "remote-control": {
+    "command": [
+      "claude",
+      "remote-control",
+      "--name",
+      "{name}",
+      "--permission-mode",
+      "auto",
+      "--capacity",
+      "2"
+    ],
+    "description": "Interactive Claude Code session paired to the Claude mobile app via Remote Control. No sijba chat relay \u2014 talk to it from your phone, not from a sijba channel; the controller only keeps the session alive.",
+    "kind": "local"
+  }
+}
