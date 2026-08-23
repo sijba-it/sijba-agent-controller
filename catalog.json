@@ -14,7 +14,7 @@
   },
   "remote-control": {
     "command": [
-      "claude",
+      "/home/rbartl/.local/bin/claude",
       "remote-control",
       "--name",
       "{name}",
