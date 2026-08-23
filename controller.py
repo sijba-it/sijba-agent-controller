@@ -190,6 +190,11 @@ async def ensure_fetched(plugin_name: str, plugin: dict) -> None:
 def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dict, str]:
     """Build (argv, env, cwd) for this project, dispatched on its plugin's kind."""
     env = _spawn_env(name, entry)
+    # Catalog-level, per-plugin overrides (e.g. cursor's CURSOR_CMD pointing
+    # at an absolute path) — kept out of the shared EnvironmentFile, which
+    # every plugin kind inherits via _spawn_env's dict(os.environ), so a
+    # knob one plugin needs doesn't leak into all the others.
+    env.update(plugin.get("env", {}))
     controller_dir = str(Path(__file__).parent)
     if plugin["kind"] == "git":
         entry_point = catalog.PLUGINS_DIR / entry["plugin"] / "main.py"
@@ -202,8 +207,10 @@ def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dic
             "-e", f"SIJBA_URL={SIJBA_URL}", "-e", f"SIJBA_TOKEN={SIJBA_TOKEN}",
             "-e", f"PROJECT_NAME={name}", "-e", "WORK_DIR=/work",
             "-e", "REGISTRY_FILE=/registry.json",
-            plugin["image"],
         ]
+        for key, val in plugin.get("env", {}).items():
+            cmd += ["-e", f"{key}={val}"]
+        cmd.append(plugin["image"])
         # Env vars for a container go via -e above, not the docker CLI's own env.
         return cmd, dict(os.environ), controller_dir
     if plugin["kind"] == "local":
