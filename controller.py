@@ -33,6 +33,7 @@ import asyncio
 import collections
 import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -135,6 +136,33 @@ def _age(ts: float) -> str:
 _procs: dict[str, asyncio.subprocess.Process] = {}
 _supervisors: dict[str, asyncio.Task] = {}
 _intentional_stop: dict[str, str] = {}  # name -> "archived" | "paused" | "removed", set right before killing
+
+# kind:local wraps a full-screen terminal UI (tmux) whose raw ANSI screen
+# redraws are noise in the shared journal (see `quiet` in _spawn) — but
+# DEVNULL swallowed that unconditionally, including the one plain-text line
+# that would've explained a crash. Captured to a file instead, per project,
+# overwritten on every (re)spawn — ensure_running() tails it into the crash
+# log line when a spawn dies fast enough that a screen was never drawn.
+_LOCAL_LOG_DIR = Path(__file__).parent / "_logs"
+_ANSI_RE = re.compile(rb"\x1b(?:\[[0-9;?]*[a-zA-Z]|\][^\x07]*\x07|[()][A-Za-z0-9]|[=>])")
+
+
+def _local_log_path(name: str) -> Path:
+    return _LOCAL_LOG_DIR / f"{name}.log"
+
+
+def _tail_local_log(name: str, max_bytes: int = 4000) -> str:
+    """Best-effort, ANSI-stripped tail of a kind:local child's captured pty
+    output, for surfacing in a crash log line. A fast crash rarely gets far
+    enough to draw a screen, so what's left is usually just the plain-text
+    error that actually explains why."""
+    try:
+        data = _local_log_path(name).read_bytes()[-max_bytes:]
+    except FileNotFoundError:
+        return ""
+    text = _ANSI_RE.sub(b"", data).decode("utf-8", "replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return " | ".join(lines[-8:])
 
 
 def _spawn_env(name: str, entry: dict) -> dict:
@@ -245,19 +273,29 @@ async def _spawn(name: str, entry: dict) -> asyncio.subprocess.Process:
     # kind:local wraps a full-screen terminal UI (tmux) — its raw ANSI
     # screen redraws are noise in the shared journal, not useful for
     # troubleshooting. The actual interaction happens via `tmux attach` or
-    # whatever the command itself pairs with, not here.
+    # whatever the command itself pairs with, not here. Captured to a file
+    # (see _LOCAL_LOG_DIR) instead of DEVNULL so a crash still has something
+    # to show — ensure_running() tails it on fast exits.
     quiet = plugin["kind"] == "local"
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=cwd,
-        env=env,
-        # git/docker plugins inherit stdout/stderr (None) — one combined
-        # journal stream, each line already prefixed with the project name
-        # by the plugin's own _log(). kind:local gets DEVNULL instead, see
-        # `quiet` above.
-        stdout=asyncio.subprocess.DEVNULL if quiet else None,
-        stderr=asyncio.subprocess.DEVNULL if quiet else None,
-    )
+    log_file = None
+    if quiet:
+        _LOCAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = open(_local_log_path(name), "wb")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            env=env,
+            # git/docker plugins inherit stdout/stderr (None) — one combined
+            # journal stream, each line already prefixed with the project
+            # name by the plugin's own _log(). kind:local gets the capture
+            # file instead, stderr merged into the same stream.
+            stdout=log_file if quiet else None,
+            stderr=asyncio.subprocess.STDOUT if quiet else None,
+        )
+    finally:
+        if log_file is not None:
+            log_file.close()
     _procs[name] = proc
     _log(f"{name}: started (pid={proc.pid}, plugin={entry['plugin']})")
     return proc
@@ -311,7 +349,13 @@ async def ensure_running(name: str) -> None:
         # Unplanned exit -> crash-loop backoff. Re-check status each spin so
         # a concurrent archive/remove during the sleep still takes effect.
         backoff = BACKOFF_BASE if uptime >= BACKOFF_RESET_AFTER else min(backoff * 2, BACKOFF_MAX)
-        _log(f"{name}: crashed (exit={code}, uptime={uptime:.0f}s) — restart in {backoff:.0f}s")
+        detail = ""
+        plugin = catalog.get(entry["plugin"])
+        if plugin is not None and plugin["kind"] == "local":
+            tail = _tail_local_log(name)
+            if tail:
+                detail = f" — {tail}"
+        _log(f"{name}: crashed (exit={code}, uptime={uptime:.0f}s){detail} — restart in {backoff:.0f}s")
         await asyncio.sleep(backoff)
 
 
@@ -995,9 +1039,26 @@ class ControllerClient:
 
     async def run_forever(self):
         loop = asyncio.get_event_loop()
+
+        def _request_shutdown() -> None:
+            # Just setting the event isn't enough — the loop below is
+            # blocked inside message_loop()'s `async for raw in self.ws`,
+            # which only unblocks on a connection event. Without closing
+            # the socket here too, shutdown_event.is_set() never gets
+            # re-checked until the connection drops on its own (a stale
+            # sijba, a ping timeout, ...) — verified live: a plain
+            # `systemctl restart` left this hung for the full 90s
+            # DefaultTimeoutStopSec before systemd killed it by force,
+            # which (with a delegated cgroup) took every supervised child
+            # down with it instead of the controlled terminate_all_children()
+            # cleanup below ever running.
+            self.shutdown_event.set()
+            if self.ws is not None:
+                asyncio.ensure_future(self.ws.close())
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, self.shutdown_event.set)
+                loop.add_signal_handler(sig, _request_shutdown)
             except NotImplementedError:
                 pass
 

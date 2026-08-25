@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 registry.json
 _plugins/
+_logs/

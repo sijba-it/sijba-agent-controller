@@ -6,6 +6,27 @@ After=network.target
 Type=simple
 User=robert
 WorkingDirectory=/home/robert/sijba-agent-controller
+# kind:local plugins run inside tmux, which (since 3.4, linked against
+# libsystemd) registers a transient scope per pane over the session D-Bus.
+# Without delegation the service manager can race that nested scope
+# creation against its own management of this unit's cgroup subtree —
+# "Couldn't move process ... to requested cgroup: No such process" in the
+# journal, tmux giving up and exiting instead of attaching, kind:local
+# crash-looping on exit=0 with no real error surfaced (see _spawn's log
+# capture in controller.py for when it does).
+Delegate=yes
+# Default KillMode=control-group means stop/restart SIGKILLs every process
+# in this unit's delegated cgroup — including the tmux *server* and the
+# `claude --remote-control` sessions living inside it, even though neither
+# is a direct child by restart time (kind:local's wrapper only
+# attaches/detaches, see _spawn_command's -A). Verified live: a restart
+# changed every remote-control session's claude PID, i.e. it killed and
+# re-launched them instead of reattaching, contradicting
+# terminate_all_children()'s whole point. KillMode=process scopes the kill
+# to controller.py's own PID — cleanup of what controller.py *does* want to
+# kill (git-kind children, the kind:local wrapper client) is already
+# handled explicitly by terminate_all_children() before the process exits.
+KillMode=process
 Environment=SIJBA_URL=https://sijba.edv-bartl.at
 Environment=SIJBA_TOKEN=your-token-here
 Environment=WORKSPACE_ROOTS=/home/robert/workspaces/sijba
