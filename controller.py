@@ -486,6 +486,22 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "claude")
     plugin_entry = catalog.get(plugin)
     if plugin_entry is None:
         return f"Unknown plugin {plugin!r}. See 'catalog list'."
+    # Project name becomes the chat trigger AND the channel label
+    # ("Cursor: <name>"). Naming a project after a catalog plugin
+    # (case-insensitive — "Cursor" vs "cursor") collides with the plugin
+    # identifier and is almost always the LLM mistaking "starte plugin
+    # Cursor … mit Label X" for name=Cursor instead of name=X,
+    # plugin=cursor. Found live: exactly that, registering "Cursor" and
+    # ignoring the user's Label. Reject so the caller has to pick a real
+    # project name (directory basename, or the Label/Name the user gave).
+    catalog_names = {n.lower() for n in catalog.list_plugins()}
+    if name.lower() in catalog_names:
+        hint = Path(path).expanduser().name if path else "<directory-basename>"
+        return (
+            f"project name {name!r} collides with a catalog plugin — that belongs "
+            f"in the plugin= argument, not name=. Use a distinct project name "
+            f"(chat trigger / Label), e.g. the Label the user gave, or {hint!r}."
+        )
     if path is None:
         hits = registry.search_paths(name)
         if len(hits) == 1:
@@ -760,9 +776,13 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "add_project",
         "description": "Register a project and start its session, using a plugin from the catalog "
-                        "(see list_catalog). Omit path to auto-search by name.",
+                        "(see list_catalog). Omit path to auto-search by name. "
+                        "name is the chat trigger / channel Label — NEVER a catalog plugin "
+                        "name like 'cursor' or 'claude' (those go in plugin=).",
         "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}, "path": {"type": "string"},
+            "name": {"type": "string", "description": "project name = chat trigger / Label "
+                "(e.g. 'sijba-root'). Not the plugin. Must not equal a catalog plugin name."},
+            "path": {"type": "string"},
             "plugin": {"type": "string", "description": "catalog plugin name, e.g. 'claude', 'cursor', or a custom one"},
         }, "required": ["name"]},
     }},
@@ -862,13 +882,19 @@ SYSTEM_PROMPT = (
     "project for X'); if they're referring to an existing project by name and "
     "list_paths missed, say you couldn't find it under the configured roots and ask "
     "for the path instead of silently creating an empty directory. "
-    "Keep the project name exactly as the user gave it — never split a multi-word "
-    "name across the search filter and the registered project name. If they don't "
-    "give a name at all, derive one from the target directory's own name (e.g. "
-    "'/home/x/Obsidian' -> 'obsidian') — never default to the plugin's name (e.g. "
-    "'cursor' or 'claude'), that collides with the plugin identifier itself and "
-    "makes the project ambiguous to refer to later, especially once more than one "
-    "project uses the same plugin. "
+    "Project name vs plugin — keep these strictly apart. Phrases like 'plugin "
+    "Cursor', 'starte Cursor', 'mit Claude' name the catalog plugin (plugin= "
+    "argument). Phrases like 'Label X', 'Name X', 'Bezeichnung X', 'als X', "
+    "'mit Label/Name X' name the project (name= argument = chat trigger / "
+    "channel label). Example: 'starte plugin Cursor in /home/x/sijba mit "
+    "Label/Name sijba-root' -> add_project(name='sijba-root', "
+    "path='/home/x/sijba', plugin='cursor'). Keep the project name exactly as "
+    "the user gave it — never split a multi-word name across the search filter "
+    "and the registered project name. If they don't give a name/Label at all, "
+    "derive one from the target directory's own name (e.g. '/home/x/Obsidian' "
+    "-> 'obsidian') — NEVER use the plugin's name as the project name "
+    "(case-insensitive: not 'cursor', 'Cursor', 'claude', ...), that collides "
+    "with the plugin identifier and makes the project ambiguous later. "
     "A project (registry) and a plugin (catalog) are different things, even when "
     "they share a name — e.g. project 'cursor' vs the catalog's 'cursor' plugin. "
     "*_project tools only ever affect that one project. If a project happens to be "
@@ -964,12 +990,18 @@ class ControllerClient:
         self.ws = None
         self.shutdown_event = asyncio.Event()
         self._reconnect_backoff = 5
+        self._msg_queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._inflight: dict[str, asyncio.Event] = {}
+        self._completed_replies: dict[str, str] = {}
 
     async def connect(self):
         ws_url = SIJBA_URL.replace("https://", "wss://").replace("http://", "ws://")
         ws_url = f"{ws_url}/api/plugin/ws?token={SIJBA_TOKEN}"
         _log(f"Connecting to {ws_url} as {PLUGIN_ID}")
-        self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=10, close_timeout=5)
+        self.ws = await websockets.connect(
+            ws_url, ping_interval=30, ping_timeout=60, close_timeout=5,
+        )
         _log("Connected!")
 
         await self.ws.send(json.dumps({
@@ -990,7 +1022,27 @@ class ControllerClient:
             },
         }))
         self._reconnect_backoff = 5
-        await self.message_loop()
+        self._worker_task = asyncio.create_task(self._message_worker())
+        try:
+            await self.message_loop()
+        finally:
+            if self._worker_task is not None:
+                self._worker_task.cancel()
+                try:
+                    await self._worker_task
+                except asyncio.CancelledError:
+                    pass
+                self._worker_task = None
+
+    async def _message_worker(self) -> None:
+        while True:
+            msg = await self._msg_queue.get()
+            try:
+                await self.handle_message(msg)
+            except Exception as exc:
+                _log(f"handle_message error: {exc}")
+            finally:
+                self._msg_queue.task_done()
 
     async def message_loop(self):
         try:
@@ -1002,7 +1054,7 @@ class ControllerClient:
                 elif mtype == "channel_registered":
                     _log(f"Channel registered: {msg['channel_id']} (ok={msg.get('ok')})")
                 elif mtype == "message":
-                    await self.handle_message(msg)
+                    await self._msg_queue.put(msg)
                 elif mtype == "ping":
                     await self.ws.send(json.dumps({"type": "pong"}))
                 elif mtype == "error":
@@ -1012,31 +1064,57 @@ class ControllerClient:
         except Exception as exc:
             _log(f"Message loop error: {exc}")
 
+    def _remember_reply(self, envelope_id: str, text: str) -> None:
+        self._completed_replies[envelope_id] = text
+        while len(self._completed_replies) > 50:
+            oldest = next(iter(self._completed_replies))
+            self._completed_replies.pop(oldest, None)
+
+    async def _send_reply(self, channel_id: str, envelope_id: str, text: str) -> None:
+        try:
+            await self.ws.send(json.dumps({
+                "type": "reply", "channel": channel_id, "envelope_id": envelope_id,
+                "text": text, "continue": True,
+            }))
+        except Exception as exc:
+            _log(f"Failed to send reply: {exc}")
+
     async def handle_message(self, msg: dict):
         channel_id = msg["channel"]
         payload = msg["payload"]
         envelope_id = payload["envelope_id"]
         text = payload["text"]
 
-        for trigger in (CONTROLLER_NAME, f"@{CONTROLLER_NAME}"):
-            if text.lower().startswith(trigger):
-                text = text[len(trigger):].strip()
-                break
-        if not text:
-            text = "help"
+        if envelope_id in self._completed_replies:
+            _log(f"redelivery of completed envelope={envelope_id} — resending reply")
+            await self._send_reply(channel_id, envelope_id, self._completed_replies[envelope_id])
+            return
+        if envelope_id in self._inflight:
+            _log(f"redelivery of in-flight envelope={envelope_id} — waiting")
+            await self._inflight[envelope_id].wait()
+            if envelope_id in self._completed_replies:
+                await self._send_reply(channel_id, envelope_id, self._completed_replies[envelope_id])
+            return
 
-        reply = await dispatch_command(text)
-        if reply is None:
-            reply = await run_llm_turn(text)
-
+        done = asyncio.Event()
+        self._inflight[envelope_id] = done
         try:
-            await self.ws.send(json.dumps({
-                "type": "reply", "channel": channel_id, "envelope_id": envelope_id,
-                "text": reply, "continue": True,
-            }))
-        except Exception as exc:
-            _log(f"Failed to send reply: {exc}")
+            for trigger in (CONTROLLER_NAME, f"@{CONTROLLER_NAME}"):
+                if text.lower().startswith(trigger):
+                    text = text[len(trigger):].strip()
+                    break
+            if not text:
+                text = "help"
 
+            reply = await dispatch_command(text)
+            if reply is None:
+                reply = await run_llm_turn(text)
+
+            self._remember_reply(envelope_id, reply)
+            await self._send_reply(channel_id, envelope_id, reply)
+        finally:
+            done.set()
+            self._inflight.pop(envelope_id, None)
     async def run_forever(self):
         loop = asyncio.get_event_loop()
 
