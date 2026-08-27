@@ -1013,9 +1013,10 @@ class ControllerClient:
                     "label": "Agent Controller" if CONTROLLER_NAME == "controller"
                              else f"Agent Controller ({CONTROLLER_NAME})",
                     "hint": (
-                        f"Manage per-project coding-agent sessions. Trigger: '{CONTROLLER_NAME} ...'. " + HELP
+                        f"Manage per-project coding-agent sessions. Trigger: '@{CONTROLLER_NAME} ...'. " + HELP
                     ),
-                    "triggers": [CONTROLLER_NAME, f"@{CONTROLLER_NAME}"],
+                    # Core only routes message text on an explicit @mention.
+                    "triggers": [f"@{CONTROLLER_NAME}"],
                     "capabilities": ["admin"],
                     "metadata": {},
                 }
