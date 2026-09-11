@@ -1,13 +1,4 @@
 {
-  "claude": {
-    "description": "Claude Code CLI, persistent session",
-    "env": {
-      "CLAUDE_CMD": "/home/rbartl/.local/bin/claude"
-    },
-    "kind": "git",
-    "ref": null,
-    "url": "ssh://git@REDACTED-GIT-HOST:7999/sijba/sijba-claude-plugin.git"
-  },
   "cursor": {
     "added_at": 1786864378.6410522,
     "description": "Cursor Agent CLI, one-shot turns via --resume",

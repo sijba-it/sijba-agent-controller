@@ -1,5 +1,5 @@
 """Plugin catalog: which backends the controller knows how to run, and
-where they come from — Claude and Cursor are just the two built-in ones.
+where they come from — cursor and remote-control are the built-in ones.
 
 Unlike registry.json (which instances are actually running, local machine
 state, gitignored), this is config: shareable across machines, meant to be
@@ -30,10 +30,6 @@ _GITEA = "ssh://git@REDACTED-GIT-HOST:7999/sijba"
 
 def _default_data() -> dict:
     return {
-        "claude": {
-            "kind": "git", "url": f"{_GITEA}/sijba-claude-plugin.git", "ref": None,
-            "description": "Claude Code CLI, persistent session",
-        },
         "cursor": {
             "kind": "git", "url": f"{_GITEA}/sijba-cursor-plugin.git", "ref": None,
             "description": "Cursor Agent CLI, one-shot turns via --resume",

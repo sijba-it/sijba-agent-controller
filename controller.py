@@ -8,12 +8,13 @@ process running, always restarting it with crash-loop backoff on
 unexpected exit — a controller reboot and a mid-run crash are handled by
 the exact same ensure_running() loop, no special-casing.
 
-Every plugin (including claude and cursor — see catalog.py) is a `kind:
-git` or `kind: docker` catalog entry, fetched once at `add` time and run as
-its own process. Those processes are self-registering (their own
-WebSocket connection, own channel) and self-managing for /archive and
-/pause — they write their own registry status and exit with a reserved
-code (exit_codes.py) before the controller ever notices. Global commands
+A `kind: git`/`kind: docker` plugin (e.g. cursor — see catalog.py) is a
+catalog entry fetched once at `add` time and run as its own process. Those
+processes are self-registering (their own WebSocket connection, own channel)
+and self-managing for /archive and /pause — they write their own registry
+status and exit with a reserved code (exit_codes.py) before the controller
+ever notices. A `kind: local` plugin (e.g. remote-control) is just a local
+command kept alive inside a tmux session. Global commands
 (`controller archive <name>`, ...) go through the same registry +
 backoff-loop state via `_intentional_stop`, so a controller-initiated stop
 is never mistaken for a crash.
@@ -68,28 +69,6 @@ PLUGIN_ID = os.environ.get("PLUGIN_ID", CONTROLLER_NAME)
 CHANNEL_ID = CONTROLLER_NAME
 PYTHON = sys.executable
 
-
-def _load_claude_plugin_api_key() -> str:
-    """Loaded from a dedicated file, deliberately never the controller's own
-    os.environ — _spawn_env below does env = dict(os.environ) for every
-    plugin kind, so anything sitting in the controller's own environment
-    reaches every spawned child, remote-control included. That plugin is a
-    real interactive session tied to the Pro/Max subscription's OAuth login
-    (`claude --remote-control`, driven from the phone app — see catalog.json);
-    an ANTHROPIC_API_KEY leaking into it would silently switch it to
-    per-token API billing instead. Reading from a file _spawn_env injects
-    only for the 'claude' plugin keeps this key out of os.environ entirely,
-    so there's nothing for the blanket inherit to pick up."""
-    path = Path(os.environ.get(
-        "CLAUDE_PLUGIN_API_KEY_FILE", str(Path.home() / ".config" / "sijba-claude-plugin-api-key"),
-    ))
-    try:
-        return path.read_text().strip()
-    except FileNotFoundError:
-        return ""
-
-
-CLAUDE_PLUGIN_API_KEY = _load_claude_plugin_api_key()
 
 BACKOFF_BASE = 5.0
 BACKOFF_MAX = 300.0
@@ -482,7 +461,7 @@ def _trust_claude_dir(path: str) -> None:
         _log(f"_trust_claude_dir({path}): {exc}")
 
 
-async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "claude") -> str:
+async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-control") -> str:
     plugin_entry = catalog.get(plugin)
     if plugin_entry is None:
         return f"Unknown plugin {plugin!r}. See 'catalog list'."
@@ -663,7 +642,7 @@ def _parse_args(rest: str) -> tuple[list[str], dict[str, str]]:
 
 
 HELP = (
-    "Commands: list | add <name> [--path P] [--plugin claude|cursor|...] | "
+    "Commands: list | add <name> [--path P] [--plugin cursor|remote-control|...] | "
     "mkdir <name> [--root R] | paths [filter] | status <name> | "
     "archive <name> | pause <name> | restore <name> | remove <name> [--wipe] | log [n] | "
     "catalog list | catalog add <name> --git URL [--ref R] [--desc D] | "
@@ -694,8 +673,8 @@ async def dispatch_command(text: str) -> Optional[str]:
         if cmd == "add":
             pos, flags = _parse_args(rest)
             if not pos:
-                return "usage: add <name> [--path P] [--plugin claude|cursor|...]"
-            return await cmd_add(pos[0], flags.get("path"), flags.get("plugin", "claude"))
+                return "usage: add <name> [--path P] [--plugin cursor|remote-control|...]"
+            return await cmd_add(pos[0], flags.get("path"), flags.get("plugin", "remote-control"))
         if cmd == "catalog":
             sub, _, subrest = rest.strip().partition(" ")
             pos, flags = _parse_args(subrest)
@@ -778,12 +757,12 @@ TOOLS = [
         "description": "Register a project and start its session, using a plugin from the catalog "
                         "(see list_catalog). Omit path to auto-search by name. "
                         "name is the chat trigger / channel Label — NEVER a catalog plugin "
-                        "name like 'cursor' or 'claude' (those go in plugin=).",
+                        "name like 'cursor' or 'remote-control' (those go in plugin=).",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "project name = chat trigger / Label "
                 "(e.g. 'sijba-root'). Not the plugin. Must not equal a catalog plugin name."},
             "path": {"type": "string"},
-            "plugin": {"type": "string", "description": "catalog plugin name, e.g. 'claude', 'cursor', or a custom one"},
+            "plugin": {"type": "string", "description": "catalog plugin name, e.g. 'remote-control', 'cursor', or a custom one"},
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
@@ -805,7 +784,7 @@ TOOLS = [
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
-        "name": "list_catalog", "description": "List available plugins (claude, cursor, and any custom git/docker ones).",
+        "name": "list_catalog", "description": "List available plugins (cursor, remote-control, and any custom git/docker ones).",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -849,7 +828,7 @@ _TOOL_IMPL = {
     "list_projects": lambda **kw: cmd_list(),
     "list_paths": lambda **kw: cmd_paths(kw.get("filter", "")),
     "mkdir": lambda **kw: cmd_mkdir(kw["name"], kw.get("root")),
-    "add_project": lambda **kw: cmd_add(kw["name"], kw.get("path"), kw.get("plugin", "claude")),
+    "add_project": lambda **kw: cmd_add(kw["name"], kw.get("path"), kw.get("plugin", "remote-control")),
     "status": lambda **kw: cmd_status(kw["name"]),
     "archive_project": lambda **kw: cmd_archive(kw["name"]),
     "restore_project": lambda **kw: cmd_restore(kw["name"]),
@@ -864,10 +843,10 @@ SYSTEM_PROMPT = (
     "You are the sijba agent controller. You manage coding-agent sessions, one per "
     "project directory, each backed by a plugin from the catalog. ALWAYS call "
     "list_catalog first, before add_project — match the user's wording against the "
-    "catalog entries' names/descriptions precisely. If they name a mode explicitly "
-    "(e.g. 'remote control', 'pair with my phone') use the catalog plugin whose "
-    "description matches that (e.g. 'remote-control'), not a generic one like "
-    "'claude' just because that word also appears in their message. "
+    "catalog entries' names/descriptions precisely. A bare request for 'Claude' / "
+    "'Claude Code' / 'a Claude session' / 'remote control' / 'pair with my phone' "
+    "means the 'remote-control' plugin (an interactive Claude Code session). Use "
+    "'cursor' only when they explicitly say Cursor. "
     "If the user already gave an explicit path (starts with / or ~, or otherwise "
     "clearly names a directory), use it AS-IS for add_project's path argument — do "
     "not call list_paths to double-check it first, and never discard a path you "
@@ -883,7 +862,7 @@ SYSTEM_PROMPT = (
     "list_paths missed, say you couldn't find it under the configured roots and ask "
     "for the path instead of silently creating an empty directory. "
     "Project name vs plugin — keep these strictly apart. Phrases like 'plugin "
-    "Cursor', 'starte Cursor', 'mit Claude' name the catalog plugin (plugin= "
+    "Cursor', 'starte Cursor', 'mit remote-control' name the catalog plugin (plugin= "
     "argument). Phrases like 'Label X', 'Name X', 'Bezeichnung X', 'als X', "
     "'mit Label/Name X' name the project (name= argument = chat trigger / "
     "channel label). Example: 'starte plugin Cursor in /home/x/sijba mit "
@@ -893,7 +872,7 @@ SYSTEM_PROMPT = (
     "and the registered project name. If they don't give a name/Label at all, "
     "derive one from the target directory's own name (e.g. '/home/x/Obsidian' "
     "-> 'obsidian') — NEVER use the plugin's name as the project name "
-    "(case-insensitive: not 'cursor', 'Cursor', 'claude', ...), that collides "
+    "(case-insensitive: not 'cursor', 'Cursor', 'remote-control', ...), that collides "
     "with the plugin identifier and makes the project ambiguous later. "
     "A project (registry) and a plugin (catalog) are different things, even when "
     "they share a name — e.g. project 'cursor' vs the catalog's 'cursor' plugin. "
