@@ -88,6 +88,24 @@ def get(name: str) -> Optional[dict]:
 def add(name: str, path: str, plugin: str) -> dict:
     if catalog.get(plugin) is None:
         raise ValueError(f"unknown plugin {plugin!r} — see 'catalog list'")
+    path = str(Path(path).expanduser())
+    if not Path(path).is_absolute():
+        # A relative path stored here is a footgun that only detonates
+        # later, and differently in each consumer: cmd_add_project's own
+        # is_dir() check resolves it against *this process's* cwd,
+        # kind:local's `tmux -c` resolves it against the tmux *server*'s
+        # cwd (frozen at that server's first-ever pane, e.g. $HOME) — so a
+        # relative path can look fine at add time and still crash-loop
+        # forever at spawn time in a directory nobody intended (found
+        # live: 'edv-bartl/einhell-charger' silently landing inside this
+        # repo's own tree, then spawning `claude` in $HOME and hitting its
+        # untrusted-home-directory guard). Reject it here instead, once,
+        # loudly — every caller should already be passing what
+        # mkdir()/search_paths() returned, both always absolute.
+        raise ValueError(
+            f"path {path!r} is not absolute — use the path 'mkdir' or 'paths' "
+            f"returned, not a bare name or org/name fragment"
+        )
     with _locked() as data:
         existing = data["projects"].get(name)
         if existing is not None:
@@ -96,13 +114,27 @@ def add(name: str, path: str, plugin: str) -> dict:
                 f"remove it first, or restore it if you want the original plugin/path back"
             )
         entry = {
-            "path": str(path),
+            "path": path,
             "plugin": plugin,
             "status": "active",
             "created_at": time.time(),
         }
         data["projects"][name] = entry
         return dict(entry)
+
+
+def set_can_inject(name: str, allowed: bool) -> None:
+    """Local record only — the authoritative flag lives in sijba Core's
+    own channel_permissions.yaml (core/channel_permissions.py), checked
+    fresh on every inject. This copy is just so `list`/`status` can show
+    it without a round-trip to Core, and so it survives being re-derived
+    if Core's own file is ever rebuilt from scratch. The caller (cmd_
+    allow_inject in controller.py) is responsible for actually pushing
+    this to Core via its admin API — set_can_inject() alone does not."""
+    with _locked() as data:
+        if name not in data["projects"]:
+            raise KeyError(name)
+        data["projects"][name]["can_inject"] = bool(allowed)
 
 
 def set_status(name: str, status: str) -> None:
@@ -161,13 +193,21 @@ def search_paths(filter_str: str = "") -> list[str]:
 
 
 def mkdir(name: str, root: Optional[str] = None) -> str:
-    """Create <root>/<name>. If an org is given via --root, honor it —
-    otherwise fall back to the first configured workspace root (today just
-    ~/workspaces), landing the new project at the top level rather than
-    guessing which org it belongs to. Errors if it already exists — this
-    only ever creates brand-new project dirs."""
-    base = Path(root) if root else Path(roots()[0])
-    target = base / name
+    """Create <workspace-root>/<root>/<name>. `root`, when given, is an
+    org-level subdirectory *under* the first configured workspace root
+    (e.g. 'edvbartl') — never a standalone path. Previously `root` was used
+    as-is (`Path(root)`), so a relative or misspelled org name (e.g.
+    'edv-bartl' instead of the existing 'edvbartl') silently created the
+    project nested inside whatever the caller's cwd happened to be — found
+    live, it landed inside this controller's own repo tree, outside every
+    configured workspace root, where nothing (not `paths`, not a human
+    browsing ~/workspaces) would ever find it again. Anchoring to
+    roots()[0] makes the result always absolute and always under a
+    searchable root, regardless of what's passed in. Omit --root to fall
+    back to the workspace root's top level. Errors if it already exists —
+    this only ever creates brand-new project dirs."""
+    base = Path(roots()[0])
+    target = (base / root / name) if root else (base / name)
     if target.exists():
         raise FileExistsError(f"{target} already exists")
     target.mkdir(parents=True)

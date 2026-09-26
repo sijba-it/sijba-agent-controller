@@ -32,6 +32,13 @@ controller instead.
 - **`registry.py`** — the shared JSON file both the controller and running
   plugin processes read/write (`registry.json`, gitignored — local machine
   state, not config).
+- **`apis.py`** — the AI API registry: named chat-completions endpoints
+  (`{url, key, description}`), e.g. `openrouter`. A catalog entry can
+  declare `"api": "<name>"` instead of embedding its own URL/key; the
+  controller resolves it fresh on every spawn and injects
+  `AI_API_URL`/`AI_API_KEY`/`AI_API_NAME` into that plugin's environment.
+  Holds secrets, so `apis.json` is gitignored like `registry.json`, not
+  committed like `catalog.json`.
 
 ### Plugin contract
 
@@ -108,12 +115,25 @@ pause <name>                             stop, no auto-restart (until resumed)
 restore <name> / resume <name>           reactivate
 remove <name> [--wipe]                   unregister (--wipe also deletes the directory)
 log [n]                                  controller's own last n log lines (default 10)
-catalog list                             available plugins
-catalog add <name> --git URL [--ref R]   register a git-sourced plugin
-catalog add <name> --docker IMAGE        register a docker-sourced plugin
-catalog add <name> --local "cmd"         register a local-command plugin
+catalog list                             available plugins, flags any that need an unconfigured API
+catalog add <name> --git URL [--ref R] [--api A]     register a git-sourced plugin
+catalog add <name> --docker IMAGE [--api A]          register a docker-sourced plugin
+catalog add <name> --local "cmd" [--api A]           register a local-command plugin
+catalog set-env <name> --env K=V,K2=V2   update env overrides on an existing plugin (e.g. pi's PI_MODEL)
 catalog remove <name>                    remove a plugin from the catalog
+apis list                                registered AI APIs (name, URL, key set y/n)
+apis add <name> --url URL [--key K]      register a new AI API
+apis set-key <name> <key>                set/rotate an API's key
+apis remove <name>                       remove an API from the registry
 ```
+
+`--api A` names an entry from `apis list` (e.g. `openrouter`) whose
+URL/key the plugin needs at runtime, injected as `AI_API_URL`/`AI_API_KEY`/
+`AI_API_NAME` — see `apis.py`. `apis add`/`set-key`/`remove` write secrets,
+so — like `catalog remove` — they're exact-syntax-only, never exposed to
+the LLM tool-calling layer; that layer only gets a read-only `list_apis`
+(no key values) to decide whether a plugin it wants to add is actually
+usable yet.
 
 Per-project channel (`<plugin>:<name>`, trigger `<name> ...`): plain text
 goes to the agent; `/archive`, `/pause`, `/log [n]` are handled locally the

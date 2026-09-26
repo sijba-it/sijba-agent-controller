@@ -38,6 +38,9 @@ Environment=WORKSPACE_ROOTS=/home/robert/workspaces/sijba
 #Environment=LLM_API_URL=https://openrouter.ai/api/v1
 #Environment=LLM_API_KEY=
 #Environment=LLM_MODEL=openai/gpt-4o-mini
+# Per-plugin AI APIs (e.g. openrouter for the "pi" plugin) are configured at
+# runtime via `controller apis add/set-key ...`, stored in apis.json next to
+# registry.json — not env vars here, since they're per-plugin, not global.
 ExecStart=/home/robert/sijba-agent-controller/.venv/bin/python controller.py
 Restart=always
 RestartSec=5

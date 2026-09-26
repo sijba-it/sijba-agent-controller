@@ -24,6 +24,9 @@ Environment variables
 SIJBA_URL, SIJBA_TOKEN                same as any sijba plugin
 REGISTRY_FILE, WORKSPACE_ROOTS         see registry.py
 CATALOG_FILE, PLUGINS_DIR              see catalog.py
+APIS_FILE                              see apis.py — a plugin whose catalog
+    entry names an "api" gets that API's URL/key injected as
+    AI_API_URL/AI_API_KEY/AI_API_NAME at spawn time, on top of its own env.
 LLM_API_URL, LLM_API_KEY, LLM_MODEL, LLM_FORMAT   optional — same shape as
     plugins-builtin/router/main.py. If LLM_API_KEY is unset, free text that
     doesn't match an exact command just gets the command list back.
@@ -48,6 +51,7 @@ from typing import Optional
 
 import websockets
 
+import apis
 import catalog
 import registry
 from exit_codes import EXIT_ARCHIVED, EXIT_PAUSED
@@ -144,16 +148,24 @@ def _tail_local_log(name: str, max_bytes: int = 4000) -> str:
     return " | ".join(lines[-8:])
 
 
-def _spawn_env(name: str, entry: dict) -> dict:
-    """Env vars common to every plugin kind."""
-    env = dict(os.environ)
-    env.update({
+def _dynamic_env(name: str, entry: dict) -> dict:
+    """The subset of a spawn's env that's computed fresh per (re)spawn,
+    as opposed to inherited straight from the controller's own os.environ.
+    Kept separate from _spawn_env's merged dict because kind:local needs
+    this list on its own — see the tmux `-e` note in _spawn_command."""
+    return {
         "SIJBA_URL": SIJBA_URL,
         "SIJBA_TOKEN": SIJBA_TOKEN,
         "PROJECT_NAME": name,
         "WORK_DIR": entry["path"],
         "REGISTRY_FILE": str(registry.REGISTRY_FILE),
-    })
+    }
+
+
+def _spawn_env(name: str, entry: dict) -> dict:
+    """Env vars common to every plugin kind."""
+    env = dict(os.environ)
+    env.update(_dynamic_env(name, entry))
     # kind:local wraps its command in tmux inside a `script`-provided pty
     # (see _spawn_command) — tmux's client needs $TERM to look up a
     # terminfo entry to even initialize, and a controller with no
@@ -188,19 +200,63 @@ async def ensure_fetched(plugin_name: str, plugin: dict) -> None:
         if not (dest / "main.py").exists():
             raise RuntimeError(f"{plugin_name!r}: expected {dest / 'main.py'} (git plugin convention)")
     elif plugin["kind"] == "docker":
-        proc = await asyncio.create_subprocess_exec("docker", "pull", plugin["image"])
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "pull", plugin["image"],
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
         code = await proc.wait()
         if code != 0:
-            raise RuntimeError(f"docker pull failed for {plugin_name!r} (exit {code})")
+            # A locally-built-only image (`docker build -t foo .`, never
+            # pushed anywhere) has no registry to pull from and always
+            # fails here — that's expected for a single-host setup, not a
+            # real fetch failure. Only error out if the image isn't
+            # present locally either, so a genuinely wrong/missing image
+            # name still fails loudly at `add` time instead of crash-
+            # looping on every spawn.
+            inspect = await asyncio.create_subprocess_exec(
+                "docker", "image", "inspect", plugin["image"],
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await inspect.wait() != 0:
+                raise RuntimeError(f"docker pull failed for {plugin_name!r} (exit {code}) and no local image found")
+
+
+def _resolve_api_env(plugin: dict) -> dict:
+    """A catalog entry may declare `"api": "<name>"` (see apis.py) instead
+    of embedding its own URL/key — resolved fresh on every spawn (not at
+    `catalog add` time) so rotating a key in apis.json takes effect on the
+    plugin's next restart, no re-add needed. Silently empty if the plugin
+    doesn't declare one, or the name isn't registered — a plugin that needs
+    an API should treat a blank AI_API_KEY as a real config error and say
+    so itself, same as SIJBA_TOKEN's own "required" checks."""
+    api_name = plugin.get("api")
+    if not api_name:
+        return {}
+    entry = apis.get(api_name)
+    if entry is None:
+        _log(f"catalog plugin references unknown api {api_name!r} — see 'apis list'")
+        return {}
+    return {"AI_API_NAME": api_name, "AI_API_URL": entry["url"], "AI_API_KEY": entry.get("key", "")}
 
 
 def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dict, str]:
     """Build (argv, env, cwd) for this project, dispatched on its plugin's kind."""
+    if "path" in entry and not Path(entry["path"]).is_absolute():
+        # Belt-and-suspenders for a hand-edited (or pre-fix) registry.json:
+        # registry.add() now rejects relative paths at write time, but if
+        # one still gets in here, fail loudly into the crash-log instead of
+        # letting kind:local's `tmux -c <relative path>` silently resolve
+        # against the tmux server's own frozen cwd (observed live: landed
+        # in $HOME, where `claude` then refused to run at all).
+        raise RuntimeError(f"{name}: project path {entry['path']!r} is not absolute — fix registry.json")
     env = _spawn_env(name, entry)
+    env.update(_resolve_api_env(plugin))
     # Catalog-level, per-plugin overrides (e.g. cursor's CURSOR_CMD pointing
     # at an absolute path) — kept out of the shared EnvironmentFile, which
     # every plugin kind inherits via _spawn_env's dict(os.environ), so a
-    # knob one plugin needs doesn't leak into all the others.
+    # knob one plugin needs doesn't leak into all the others. Applied after
+    # the api= resolution so an explicit plugin.env entry can still override
+    # e.g. AI_API_URL for a one-off if it ever needs to.
     env.update(plugin.get("env", {}))
     controller_dir = str(Path(__file__).parent)
     if plugin["kind"] == "git":
@@ -215,7 +271,7 @@ def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dic
             "-e", f"PROJECT_NAME={name}", "-e", "WORK_DIR=/work",
             "-e", "REGISTRY_FILE=/registry.json",
         ]
-        for key, val in plugin.get("env", {}).items():
+        for key, val in {**_resolve_api_env(plugin), **plugin.get("env", {})}.items():
             cmd += ["-e", f"{key}={val}"]
         cmd.append(plugin["image"])
         # Env vars for a container go via -e above, not the docker CLI's own env.
@@ -236,8 +292,27 @@ def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dic
         argv = [part.format(name=name, work_dir=entry["path"]) for part in plugin["command"]]
         session_name = f"sijba-{name}"
         inner = " ".join(shlex.quote(a) for a in argv)
+        # `env=env` on the subprocess call below only sets the environment
+        # of the `script`/`tmux` *client* process — a brand-new pane's own
+        # environment instead comes from the tmux *server*'s global
+        # environment, frozen at whatever it was when that long-running
+        # server process first started (e.g. this morning, for the very
+        # first kind:local session) — the client's current env at
+        # new-session time is NOT what a fresh pane inherits, contrary to
+        # what you'd expect from a plain fork/exec. Found live: a plugin
+        # needing AI_API_KEY (added to the catalog/apis registry long after
+        # the tmux server was already running for other projects) got a
+        # completely empty AI_API_KEY in its pane despite it being right
+        # there in `env`. Explicit `-e KEY=VALUE` per var (tmux >= 3.2)
+        # sets that session's own environment directly, bypassing the
+        # server's stale global one — only the per-spawn dynamic vars need
+        # this, not all of `env`, since everything else already matches
+        # what the server captured at its own start (the controller's own
+        # os.environ doesn't change at runtime).
+        dynamic_env = {**_dynamic_env(name, entry), **_resolve_api_env(plugin), **plugin.get("env", {})}
+        env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in dynamic_env.items())
         tmux_cmd = (
-            f"tmux new-session -A -s {shlex.quote(session_name)} "
+            f"tmux new-session -A -s {shlex.quote(session_name)} {env_flags} "
             f"-c {shlex.quote(entry['path'])} {inner}"
         )
         return ["script", "-qc", tmux_cmd, "/dev/null"], env, entry["path"]
@@ -489,7 +564,7 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-c
             return "Multiple matches, be specific with --path:\n" + "\n".join(hits)
         else:
             return f"No directory found for {name!r}. Use 'mkdir {name}' to create one first, or pass --path."
-    elif not Path(path).expanduser().is_dir():
+    elif not Path(path).expanduser().is_absolute() or not Path(path).expanduser().is_dir():
         # A bare name mistaken for an explicit path (e.g. the LLM tool-call
         # reading "in dem verzeichnis X" as "path=X" instead of "name=X" to
         # search for) would otherwise register a project whose cwd doesn't
@@ -498,6 +573,18 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-c
         # this, for 'aiaccountant-export'. Fall back to the same search
         # add(path=None) does, so a plain name still resolves; only error
         # out if that search also can't find it.
+        #
+        # The is_absolute() check matters just as much as is_dir(): a
+        # relative path can coincidentally exist under *this process's*
+        # cwd (e.g. a directory 'mkdir' just created, since that bug also
+        # resolved relative to cwd) and pass is_dir() here, while every
+        # downstream consumer resolves the same relative path against a
+        # *different* cwd (kind:local's tmux server, frozen at whatever
+        # its first pane's cwd was) — so it looks registered and healthy
+        # here and only fails later, silently, at spawn time. Treating any
+        # non-absolute path as "not a real path" and falling to search
+        # closes that gap; registry.add() also now rejects relative paths
+        # outright as a second layer.
         hits = registry.search_paths(path)
         if len(hits) == 1:
             path = hits[0]
@@ -517,6 +604,37 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-c
     entry = registry.add(name, path, plugin)
     start_supervising(name)
     return f"Added {name}: {entry['plugin']} @ {entry['path']}, starting."
+
+
+def _core_http_base() -> str:
+    """SIJBA_URL is a wss://... URL (for the plugin WebSocket) — Core's
+    plain HTTP admin API lives at the same host over https://."""
+    return SIJBA_URL.replace("wss://", "https://").replace("ws://", "http://")
+
+
+def cmd_allow_inject(name: str, allowed: bool) -> str:
+    """Set whether `name`'s channel may use the cross-channel `inject`
+    message (see sijba's core/channel_permissions.py). This is exact-
+    syntax-only, never an LLM tool call — same reasoning as apis add/
+    set-key/remove: it's a security-relevant permission change, not
+    something free text should trigger on an ambiguous phrasing."""
+    entry = registry.get(name)
+    if entry is None:
+        return f"No such project: {name}"
+    channel_id = f"{entry['plugin']}:{name}"
+    url = f"{_core_http_base()}/api/admin/channel-permissions/{channel_id}"
+    req = urllib.request.Request(
+        url, method="PATCH",
+        data=json.dumps({"can_inject": allowed}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {SIJBA_TOKEN}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
+    except urllib.error.URLError as exc:
+        return f"Core update failed ({exc}) — registry.json left unchanged"
+    registry.set_can_inject(name, allowed)
+    return f"{channel_id}: can_inject = {allowed}"
 
 
 def cmd_status(name: str) -> str:
@@ -591,30 +709,108 @@ def cmd_catalog_list() -> str:
         else:
             detail = "?"
         desc = f" — {p['description']}" if p.get("description") else ""
-        lines.append(f"- {name} [{p['kind']}]: {detail}{desc}")
+        api_name = p.get("api")
+        api_note = ""
+        if api_name:
+            api_entry = apis.get(api_name)
+            configured = bool(api_entry and api_entry.get("key"))
+            flag = "" if configured else ", no key set — see 'apis list'"
+            api_note = f" [needs api: {api_name}{flag}]"
+        lines.append(f"- {name} [{p['kind']}]: {detail}{desc}{api_note}")
     return "\n".join(lines)
 
 
-def cmd_catalog_add_git(name: str, url: str, ref: Optional[str] = None, description: str = "") -> str:
-    entry = catalog.add_git(name, url, ref, description)
+def _parse_env_flag(s: Optional[str]) -> dict:
+    """`--env "KEY=VAL,KEY2=VAL2"` -> {"KEY": "VAL", "KEY2": "VAL2"}. Comma-
+    separated rather than repeatable --env flags because _parse_args (the
+    exact-syntax parser above) keeps flags as a name->value dict, last one
+    wins — a repeatable flag would silently drop all but the last pair."""
+    if not s:
+        return {}
+    pairs = {}
+    for part in s.split(","):
+        key, sep, val = part.partition("=")
+        if sep:
+            pairs[key.strip()] = val.strip()
+    return pairs
+
+
+def cmd_catalog_add_git(
+    name: str, url: str, ref: Optional[str] = None, description: str = "", api: Optional[str] = None,
+    env: Optional[dict] = None,
+) -> str:
+    entry = catalog.add_git(name, url, ref, description, api, env)
     return f"Catalog: {name} added ({entry['kind']}: {url})"
 
 
-def cmd_catalog_add_docker(name: str, image: str, description: str = "") -> str:
-    entry = catalog.add_docker(name, image, description)
+def cmd_catalog_add_docker(
+    name: str, image: str, description: str = "", api: Optional[str] = None, env: Optional[dict] = None,
+) -> str:
+    entry = catalog.add_docker(name, image, description, api, env)
     return f"Catalog: {name} added ({entry['kind']}: {image})"
 
 
-def cmd_catalog_add_local(name: str, command: str, description: str = "") -> str:
+def cmd_catalog_add_local(
+    name: str, command: str, description: str = "", api: Optional[str] = None, env: Optional[dict] = None,
+) -> str:
     argv = shlex.split(command)
-    entry = catalog.add_local(name, argv, description)
+    entry = catalog.add_local(name, argv, description, api, env)
     return f"Catalog: {name} added ({entry['kind']}: {' '.join(argv)})"
+
+
+def cmd_catalog_set_env(name: str, env: dict) -> str:
+    """Update just the env overrides on an existing catalog entry — the
+    add_* commands above reject a name that's already registered, so
+    changing e.g. pi's PI_MODEL after the fact needs a separate path rather
+    than remove+re-add (which would also lose api=/description if the
+    caller forgot to repeat them)."""
+    entry = catalog.get(name)
+    if entry is None:
+        return f"No such plugin: {name}"
+    catalog.remove(name)
+    merged_env = {**entry.get("env", {}), **env}
+    if entry["kind"] == "git":
+        catalog.add_git(name, entry["url"], entry.get("ref"), entry.get("description", ""), entry.get("api"), merged_env)
+    elif entry["kind"] == "docker":
+        catalog.add_docker(name, entry["image"], entry.get("description", ""), entry.get("api"), merged_env)
+    else:
+        catalog.add_local(name, entry["command"], entry.get("description", ""), entry.get("api"), merged_env)
+    return f"Catalog: {name} env updated ({merged_env})"
 
 
 def cmd_catalog_remove(name: str) -> str:
     if not catalog.remove(name):
         return f"No such plugin: {name}"
     return f"Catalog: {name} removed."
+
+
+def cmd_apis_list() -> str:
+    entries = apis.list_apis()
+    if not entries:
+        return "No APIs registered."
+    lines = []
+    for name, a in sorted(entries.items()):
+        key_state = "key set" if a.get("key") else "no key"
+        desc = f" — {a['description']}" if a.get("description") else ""
+        lines.append(f"- {name}: {a['url']} [{key_state}]{desc}")
+    return "\n".join(lines)
+
+
+def cmd_apis_add(name: str, url: str, key: str = "", description: str = "") -> str:
+    entry = apis.add(name, url, key, description)
+    key_state = "key set" if entry.get("key") else "no key"
+    return f"API: {name} added ({entry['url']}, {key_state})"
+
+
+def cmd_apis_set_key(name: str, key: str) -> str:
+    apis.set_key(name, key)
+    return f"API: {name} key updated."
+
+
+def cmd_apis_remove(name: str) -> str:
+    if not apis.remove(name):
+        return f"No such api: {name}"
+    return f"API: {name} removed."
 
 
 # ---------------------------------------------------------------------------
@@ -645,9 +841,13 @@ HELP = (
     "Commands: list | add <name> [--path P] [--plugin cursor|remote-control|...] | "
     "mkdir <name> [--root R] | paths [filter] | status <name> | "
     "archive <name> | pause <name> | restore <name> | remove <name> [--wipe] | log [n] | "
-    "catalog list | catalog add <name> --git URL [--ref R] [--desc D] | "
-    "catalog add <name> --docker IMAGE [--desc D] | "
-    "catalog add <name> --local \"cmd {name} {work_dir}\" [--desc D] | catalog remove <name>"
+    "allow-inject <name> true|false | "
+    "catalog list | catalog add <name> --git URL [--ref R] [--api A] [--env K=V,K2=V2] [--desc D] | "
+    "catalog add <name> --docker IMAGE [--api A] [--env K=V] [--desc D] | "
+    "catalog add <name> --local \"cmd {name} {work_dir}\" [--api A] [--env K=V] [--desc D] | "
+    "catalog set-env <name> --env K=V,K2=V2 | catalog remove <name> | "
+    "apis list | apis add <name> --url URL [--key K] [--desc D] | "
+    "apis set-key <name> <key> | apis remove <name>"
 )
 
 
@@ -682,19 +882,43 @@ async def dispatch_command(text: str) -> Optional[str]:
                 return cmd_catalog_list()
             if sub == "add":
                 if not pos:
-                    return "usage: catalog add <name> --git URL [--ref R] | catalog add <name> --docker IMAGE"
+                    return "usage: catalog add <name> --git URL [--ref R] [--api A] [--env K=V,K2=V2] | catalog add <name> --docker IMAGE [--api A]"
+                api = flags.get("api")
+                env = _parse_env_flag(flags.get("env"))
                 if "git" in flags:
-                    return cmd_catalog_add_git(pos[0], flags["git"], flags.get("ref"), flags.get("desc", ""))
+                    return cmd_catalog_add_git(pos[0], flags["git"], flags.get("ref"), flags.get("desc", ""), api, env)
                 if "docker" in flags:
-                    return cmd_catalog_add_docker(pos[0], flags["docker"], flags.get("desc", ""))
+                    return cmd_catalog_add_docker(pos[0], flags["docker"], flags.get("desc", ""), api, env)
                 if "local" in flags:
-                    return cmd_catalog_add_local(pos[0], flags["local"], flags.get("desc", ""))
-                return "usage: catalog add <name> --git URL | --docker IMAGE | --local \"cmd\""
+                    return cmd_catalog_add_local(pos[0], flags["local"], flags.get("desc", ""), api, env)
+                return "usage: catalog add <name> --git URL | --docker IMAGE | --local \"cmd\" [--api A] [--env K=V,K2=V2]"
+            if sub == "set-env":
+                if not pos or "env" not in flags:
+                    return "usage: catalog set-env <name> --env K=V,K2=V2"
+                return cmd_catalog_set_env(pos[0], _parse_env_flag(flags["env"]))
             if sub == "remove":
                 if not pos:
                     return "usage: catalog remove <name>"
                 return cmd_catalog_remove(pos[0])
-            return "usage: catalog list | catalog add <name> --git URL|--docker IMAGE | catalog remove <name>"
+            return "usage: catalog list | catalog add <name> --git URL|--docker IMAGE [--api A] [--env K=V] | catalog set-env <name> --env K=V | catalog remove <name>"
+        if cmd == "apis":
+            sub, _, subrest = rest.strip().partition(" ")
+            pos, flags = _parse_args(subrest)
+            if sub == "list":
+                return cmd_apis_list()
+            if sub == "add":
+                if not pos or "url" not in flags:
+                    return "usage: apis add <name> --url URL [--key K] [--desc D]"
+                return cmd_apis_add(pos[0], flags["url"], flags.get("key", ""), flags.get("desc", ""))
+            if sub == "set-key":
+                if len(pos) < 2:
+                    return "usage: apis set-key <name> <key>"
+                return cmd_apis_set_key(pos[0], pos[1])
+            if sub == "remove":
+                if not pos:
+                    return "usage: apis remove <name>"
+                return cmd_apis_remove(pos[0])
+            return "usage: apis list | apis add <name> --url URL [--key K] | apis set-key <name> <key> | apis remove <name>"
         if cmd == "status":
             pos, _ = _parse_args(rest)
             if not pos:
@@ -710,6 +934,11 @@ async def dispatch_command(text: str) -> Optional[str]:
             if not pos:
                 return "usage: pause <name>"
             return await cmd_pause(pos[0])
+        if cmd == "allow-inject":
+            pos, _ = _parse_args(rest)
+            if len(pos) != 2 or pos[1] not in ("true", "false"):
+                return "usage: allow-inject <name> true|false"
+            return cmd_allow_inject(pos[0], pos[1] == "true")
         if cmd in ("restore", "resume"):
             pos, _ = _parse_args(rest)
             if not pos:
@@ -749,7 +978,10 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "mkdir", "description": "Create a brand-new project directory. Does not register it.",
         "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}, "root": {"type": "string"}
+            "name": {"type": "string"},
+            "root": {"type": "string", "description": "Existing org-level subdirectory under the "
+                     "workspace root, e.g. 'edvbartl' — NOT a full path. Check 'paths' or 'list' "
+                     "first for the org name already in use; do not invent a new spelling."}
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
@@ -784,7 +1016,14 @@ TOOLS = [
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
-        "name": "list_catalog", "description": "List available plugins (cursor, remote-control, and any custom git/docker ones).",
+        "name": "list_catalog", "description": "List available plugins (cursor, remote-control, and any custom git/docker ones), "
+                        "each noting whether it needs an API (see list_apis) and whether that API has a key configured.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "list_apis",
+        "description": "List registered AI APIs (name, URL, whether a key is configured) that a plugin can "
+                        "reference via api=. Never returns the actual key.",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -794,12 +1033,16 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "url": {"type": "string"},
             "ref": {"type": "string"}, "description": {"type": "string"},
+            "api": {"type": "string", "description": "name of an existing entry in list_apis whose "
+                    "URL/key this plugin needs injected as AI_API_URL/AI_API_KEY. Must already exist — "
+                    "this never creates or edits an api entry."},
         }, "required": ["name", "url"]},
     }},
     {"type": "function", "function": {
         "name": "add_docker_plugin", "description": "Register a new plugin sourced from a docker image.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "image": {"type": "string"}, "description": {"type": "string"},
+            "api": {"type": "string", "description": "see add_git_plugin's api param"},
         }, "required": ["name", "image"]},
     }},
     {"type": "function", "function": {
@@ -809,6 +1052,7 @@ TOOLS = [
                         "{name} and {work_dir} placeholders are substituted at start time.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "command": {"type": "string"}, "description": {"type": "string"},
+            "api": {"type": "string", "description": "see add_git_plugin's api param"},
         }, "required": ["name", "command"]},
     }},
     # No remove_plugin here on purpose — see cmd_catalog_remove. Deleting a
@@ -822,6 +1066,11 @@ TOOLS = [
     # human noticed something was off and it got manually restored. Catalog
     # removal now requires the exact "controller catalog remove <name>"
     # command, typed by a human on purpose.
+    #
+    # Same reasoning for apis add/set-key/remove: those write secrets
+    # (apis.json), so they're exact-syntax-only ("controller apis ..."),
+    # never LLM tool calls. list_apis is read-only and never returns the
+    # key itself, so it's safe to expose.
 ]
 
 _TOOL_IMPL = {
@@ -834,16 +1083,23 @@ _TOOL_IMPL = {
     "restore_project": lambda **kw: cmd_restore(kw["name"]),
     "remove_project": lambda **kw: cmd_remove(kw["name"], kw.get("wipe", False)),
     "list_catalog": lambda **kw: cmd_catalog_list(),
-    "add_git_plugin": lambda **kw: cmd_catalog_add_git(kw["name"], kw["url"], kw.get("ref"), kw.get("description", "")),
-    "add_docker_plugin": lambda **kw: cmd_catalog_add_docker(kw["name"], kw["image"], kw.get("description", "")),
-    "add_local_plugin": lambda **kw: cmd_catalog_add_local(kw["name"], kw["command"], kw.get("description", "")),
+    "list_apis": lambda **kw: cmd_apis_list(),
+    "add_git_plugin": lambda **kw: cmd_catalog_add_git(
+        kw["name"], kw["url"], kw.get("ref"), kw.get("description", ""), kw.get("api")),
+    "add_docker_plugin": lambda **kw: cmd_catalog_add_docker(
+        kw["name"], kw["image"], kw.get("description", ""), kw.get("api")),
+    "add_local_plugin": lambda **kw: cmd_catalog_add_local(
+        kw["name"], kw["command"], kw.get("description", ""), kw.get("api")),
 }
 
 SYSTEM_PROMPT = (
     "You are the sijba agent controller. You manage coding-agent sessions, one per "
     "project directory, each backed by a plugin from the catalog. ALWAYS call "
     "list_catalog first, before add_project — match the user's wording against the "
-    "catalog entries' names/descriptions precisely. A bare request for 'Claude' / "
+    "catalog entries' names/descriptions precisely. If the chosen plugin's listing "
+    "says '[needs api: X, no key set]', add_project will still start it, but say so up "
+    "front — the session will fail until a human runs 'controller apis set-key X ...'; "
+    "never try to set the key yourself, you have no tool for that. A bare request for 'Claude' / "
     "'Claude Code' / 'a Claude session' / 'remote control' / 'pair with my phone' "
     "means the 'remote-control' plugin (an interactive Claude Code session). Use "
     "'cursor' only when they explicitly say Cursor. "

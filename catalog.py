@@ -6,6 +6,11 @@ state, gitignored), this is config: shareable across machines, meant to be
 committed. `controller.py` lets you edit it from chat the same way it edits
 the registry (locked read-modify-write), but the file itself is meant to be
 readable/reviewable on its own.
+
+A plugin entry may carry an optional `api` field naming an entry in
+apis.py's registry (e.g. "openrouter") — the actual URL/key live there, not
+here, since apis.json holds secrets and this file doesn't. `controller.py`
+resolves `api` at spawn time and injects it into the plugin's environment.
 """
 from __future__ import annotations
 
@@ -85,18 +90,32 @@ def _add(name: str, entry: dict) -> dict:
         return dict(entry)
 
 
-def add_git(name: str, url: str, ref: Optional[str] = None, description: str = "") -> dict:
-    return _add(name, {"kind": "git", "url": url, "ref": ref, "description": description})
+def add_git(
+    name: str, url: str, ref: Optional[str] = None, description: str = "",
+    api: Optional[str] = None, env: Optional[dict] = None,
+) -> dict:
+    return _add(name, {
+        "kind": "git", "url": url, "ref": ref, "description": description, "api": api, "env": env or {},
+    })
 
 
-def add_docker(name: str, image: str, description: str = "") -> dict:
-    return _add(name, {"kind": "docker", "image": image, "description": description})
+def add_docker(
+    name: str, image: str, description: str = "", api: Optional[str] = None, env: Optional[dict] = None,
+) -> dict:
+    return _add(name, {
+        "kind": "docker", "image": image, "description": description, "api": api, "env": env or {},
+    })
 
 
-def add_local(name: str, command: list[str], description: str = "") -> dict:
+def add_local(
+    name: str, command: list[str], description: str = "", api: Optional[str] = None,
+    env: Optional[dict] = None,
+) -> dict:
     """A plugin that's just a local command — no fetch step. `command` may
     use `{name}`/`{work_dir}` placeholders, filled in at spawn time."""
-    return _add(name, {"kind": "local", "command": command, "description": description})
+    return _add(name, {
+        "kind": "local", "command": command, "description": description, "api": api, "env": env or {},
+    })
 
 
 def remove(name: str) -> bool:

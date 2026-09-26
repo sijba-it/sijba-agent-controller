@@ -9,6 +9,16 @@
     "ref": null,
     "url": "ssh://git@REDACTED-GIT-HOST:7999/sijba/sijba-cursor-plugin.git"
   },
+  "pi": {
+    "added_at": 1789307606.5122457,
+    "api": "openrouter",
+    "description": "Pi coding agent (pi.dev, real CLI with tools/file access) in Docker, see sijba-pi-plugin/README.md",
+    "env": {
+      "HOME": "/work"
+    },
+    "image": "sijba-pi:latest",
+    "kind": "docker"
+  },
   "remote-control": {
     "command": [
       "/home/rbartl/.local/bin/claude",
