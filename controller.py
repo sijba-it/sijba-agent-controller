@@ -537,6 +537,7 @@ def _trust_claude_dir(path: str) -> None:
 
 
 async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-control") -> str:
+    global _pending_mkdir_retry
     plugin_entry = catalog.get(plugin)
     if plugin_entry is None:
         return f"Unknown plugin {plugin!r}. See 'catalog list'."
@@ -563,6 +564,12 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-c
         elif len(hits) > 1:
             return "Multiple matches, be specific with --path:\n" + "\n".join(hits)
         else:
+            # Armed here (plain `add <name>`, zero search hits) rather than
+            # in the explicit-but-wrong-path branch below — a bare name has
+            # one unambiguous default location (workspace root top level,
+            # see registry.mkdir), while an explicit wrong path gives no
+            # safe way to guess which org subdirectory was actually meant.
+            _pending_mkdir_retry = {"name": name, "plugin": plugin}
             return f"No directory found for {name!r}. Use 'mkdir {name}' to create one first, or pass --path."
     elif not Path(path).expanduser().is_absolute() or not Path(path).expanduser().is_dir():
         # A bare name mistaken for an explicit path (e.g. the LLM tool-call
@@ -606,6 +613,52 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-c
     return f"Added {name}: {entry['plugin']} @ {entry['path']}, starting."
 
 
+# ---------------------------------------------------------------------------
+# Deterministic "missing directory" confirmation harness. cmd_add's "No
+# directory found" reply asks the human to 'mkdir <name>' first — chaining
+# that into a retry across two separate incoming chat messages needs *some*
+# state, but the optional LLM tool-calling layer (run_llm_turn) may be
+# running a cheap/weak model with no guarantee it re-issues add_project
+# after mkdir, or may not be configured at all. This fast-path never calls
+# the LLM, so a plain "ja"/"leg an" works identically either way, and takes
+# priority over both dispatch_command and run_llm_turn for the one thing it
+# recognizes. See cmd_add for why only the zero-search-hits case arms it.
+# ---------------------------------------------------------------------------
+
+_pending_mkdir_retry: Optional[dict] = None
+
+_CONFIRM_WORDS = {
+    "ja", "ja bitte", "yes", "y", "ok", "okay", "mach", "mach's", "mach das",
+    "leg an", "leg's an", "leg es an", "anlegen", "erstellen", "erstelle",
+    "create", "create it", "bitte", "los", "go",
+}
+_DECLINE_WORDS = {
+    "nein", "no", "n", "nicht", "abbrechen", "cancel", "stop", "lass es",
+}
+
+
+async def _check_pending_mkdir_retry(text: str) -> Optional[str]:
+    """Single-shot: the message right after a 'No directory found' reply
+    either confirms, declines, or isn't about it at all — either way the
+    pending state is gone after this one check, so a stray 'ja' several
+    messages later (about something unrelated) can never misfire."""
+    global _pending_mkdir_retry
+    pending = _pending_mkdir_retry
+    if pending is None:
+        return None
+    _pending_mkdir_retry = None
+    normalized = text.strip().lower().rstrip(".!")
+    if normalized in _DECLINE_WORDS:
+        return "Abgebrochen."
+    if normalized not in _CONFIRM_WORDS:
+        return None
+    try:
+        path = registry.mkdir(pending["name"])
+    except FileExistsError as exc:
+        return str(exc)
+    return await cmd_add(pending["name"], path, pending["plugin"])
+
+
 def _core_http_base() -> str:
     """SIJBA_URL is a wss://... URL (for the plugin WebSocket) — Core's
     plain HTTP admin API lives at the same host over https://."""
@@ -626,7 +679,15 @@ def cmd_allow_inject(name: str, allowed: bool) -> str:
     req = urllib.request.Request(
         url, method="PATCH",
         data=json.dumps({"can_inject": allowed}).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {SIJBA_TOKEN}"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {SIJBA_TOKEN}",
+            # Cloudflare in front of sijba.edv-bartl.at blocks the default
+            # "Python-urllib/x.y" User-Agent outright (error code 1010,
+            # browser-integrity check) — found live, a real 403 with a
+            # valid token. Any non-default UA clears it.
+            "User-Agent": "sijba-agent-controller",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -1135,6 +1196,16 @@ SYSTEM_PROMPT = (
     "*_project tools only ever affect that one project. If a project happens to be "
     "named the same as a plugin, that is never a reason to touch the catalog — you "
     "have no catalog-removal tool at all, on purpose. "
+    "Stopping/removing a project: 'entfernen', 'löschen', 'raus damit', 'delete', "
+    "'remove', 'unregister', 'kill' all mean call remove_project(name=...) — match "
+    "the name case-insensitively against the project list (call list_projects first "
+    "if you're not sure of the exact stored casing, e.g. user says 'teslabox' but "
+    "it's registered as 'TeslaBox'). 'stop but keep it registered for later' means "
+    "archive_project; 'bring it back' means restore_project. You MUST actually call "
+    "the matching tool and see its result before telling the user it's done — never "
+    "say something was removed/archived/restored/added/created unless that came back "
+    "as a tool result in THIS turn. If no tool matches the request, say so instead "
+    "of guessing. "
     "Keep replies short."
 )
 
@@ -1161,11 +1232,25 @@ def _post(url: str, payload: dict, extra_headers: dict = None) -> dict:
 # single turn generates internally) to stay compact.
 _llm_history: list[dict] = []
 LLM_HISTORY_TURNS = 20  # ~10 back-and-forths
+# These are meant to be short, self-contained exchanges ("which directory did
+# you mean?" / "edvbartl/zahnrad"), not day-spanning conversations — carrying
+# stale context past a long idle gap risks the model conflating an unrelated
+# new request with whatever was being discussed hours ago. Reset on the next
+# turn's arrival rather than on a timer, so an idle controller doesn't need
+# its own background task just to expire history nobody's using anyway.
+LLM_HISTORY_TTL = 900  # seconds
+_llm_history_last_at = 0.0
 
 
 async def run_llm_turn(user_text: str) -> str:
+    global _llm_history_last_at
     if not LLM_API_KEY:
         return f"Unrecognized command. {HELP}"
+
+    now = time.time()
+    if now - _llm_history_last_at > LLM_HISTORY_TTL:
+        _llm_history.clear()
+    _llm_history_last_at = now
 
     _llm_history.append({"role": "user", "content": user_text})
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _llm_history[-LLM_HISTORY_TURNS:]
@@ -1342,9 +1427,23 @@ class ControllerClient:
             if not text:
                 text = "help"
 
-            reply = await dispatch_command(text)
+            # Full visibility into what came in and which path answered it —
+            # found live (TeslaBox, then gridfinity-box): a user asks to
+            # remove a project, gets told it's done, nothing actually
+            # changes, and there is *zero* trace anywhere of why, because
+            # only successful LLM tool calls were ever logged. Without
+            # logging the raw request and which handler produced the reply,
+            # every failure like that is unfalsifiable after the fact.
+            _log(f"<- [{channel_id}] {text!r}")
+            reply = await _check_pending_mkdir_retry(text)
+            path = "mkdir_retry"
+            if reply is None:
+                reply = await dispatch_command(text)
+                path = "exact_cmd"
             if reply is None:
                 reply = await run_llm_turn(text)
+                path = "llm"
+            _log(f"-> [{channel_id}] via {path}: {reply[:200]!r}")
 
             self._remember_reply(envelope_id, reply)
             await self._send_reply(channel_id, envelope_id, reply)
