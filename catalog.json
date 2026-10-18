@@ -28,7 +28,8 @@
       "--permission-mode",
       "auto",
       "--capacity",
-      "2"
+      "2",
+      "--spawn=same-dir"
     ],
     "description": "Interactive Claude Code session paired to the Claude mobile app via Remote Control. No sijba chat relay \u2014 talk to it from your phone, not from a sijba channel; the controller only keeps the session alive.",
     "kind": "local"

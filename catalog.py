@@ -40,7 +40,19 @@ def _default_data() -> dict:
             "description": "Cursor Agent CLI, one-shot turns via --resume",
         },
         "remote-control": {
-            "kind": "local", "command": ["claude", "--remote-control", "{name}"],
+            "kind": "local",
+            # --spawn=same-dir: a brand-new/freshly-cloned project directory
+            # makes the `claude remote-control` CLI prompt interactively
+            # ("Spawn mode for this project: [1] same-dir [2] worktree ...")
+            # the first time it's run there — found live (z-memex, a fresh
+            # git clone), nothing answers that prompt inside the tmux/script
+            # wrapper, so the session just sits there forever looking
+            # "started" with no actual chat relay. Pin the default so it
+            # never asks.
+            "command": [
+                "claude", "remote-control", "--name", "{name}",
+                "--permission-mode", "auto", "--capacity", "2", "--spawn=same-dir",
+            ],
             "description": (
                 "Interactive Claude Code session paired to the Claude mobile app via "
                 "Remote Control. No sijba chat relay — talk to it from your phone, not "
