@@ -16,7 +16,7 @@
     "env": {
       "HOME": "/work"
     },
-    "image": "sijba-pi:latest",
+    "image": "ghcr.io/sijba-it/sijba-pi-plugin:latest",
     "kind": "docker"
   },
   "remote-control": {
