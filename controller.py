@@ -221,6 +221,42 @@ async def ensure_fetched(plugin_name: str, plugin: dict) -> None:
                 raise RuntimeError(f"docker pull failed for {plugin_name!r} (exit {code}) and no local image found")
 
 
+_plugin_sync_locks: dict[str, asyncio.Lock] = {}
+_plugin_synced_at: dict[str, float] = {}
+PLUGIN_SYNC_MIN_INTERVAL = 60.0
+
+
+async def sync_git_plugin(plugin_name: str, plugin: dict) -> None:
+    """Called when a project's supervisor *starts* (controller boot, restore,
+    add) - not on every crash-loop retry. ensure_fetched() alone only runs at
+    `add` time, so a plugin dir that was never cloned (registry/catalog edited
+    by hand, _plugins/ wiped) or a plugin repo that moved on stayed stale until
+    someone re-ran `add`. Missing -> clone; present -> best-effort ff-only pull
+    (a failed pull just logs and keeps running the code that's already there).
+    Serialised per plugin so several projects booting at once don't fight over
+    the same git index."""
+    if plugin["kind"] != "git":
+        return
+    lock = _plugin_sync_locks.setdefault(plugin_name, asyncio.Lock())
+    async with lock:
+        dest = catalog.PLUGINS_DIR / plugin_name
+        if not (dest / "main.py").exists():
+            _log(f"plugin {plugin_name!r}: not present at {dest} - fetching")
+            await ensure_fetched(plugin_name, plugin)
+            _plugin_synced_at[plugin_name] = time.time()
+            return
+        if time.time() - _plugin_synced_at.get(plugin_name, 0) < PLUGIN_SYNC_MIN_INTERVAL:
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(dest), "pull", "--ff-only", "-q",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        _plugin_synced_at[plugin_name] = time.time()
+        if proc.returncode != 0:
+            _log(f"plugin {plugin_name!r}: git pull failed (exit {proc.returncode}) - "
+                 f"running existing checkout: {err.decode(errors='replace').strip()[:200]}")
+
 def _resolve_api_env(plugin: dict) -> dict:
     """A catalog entry may declare `"api": "<name>"` (see apis.py) instead
     of embedding its own URL/key — resolved fresh on every spawn (not at
@@ -360,6 +396,7 @@ async def ensure_running(name: str) -> None:
     with crash-loop backoff on unexpected exit. Same function for first
     start, controller-reboot start, and post-crash restart."""
     backoff = BACKOFF_BASE
+    first_spin = True
     while True:
         entry = registry.get(name)
         if entry is None or entry.get("status") != "active":
@@ -368,6 +405,14 @@ async def ensure_running(name: str) -> None:
 
         started_at = time.time()
         try:
+            plugin = catalog.get(entry["plugin"])
+            if plugin is not None and plugin["kind"] == "git":
+                dest_main = catalog.PLUGINS_DIR / entry["plugin"] / "main.py"
+                # pull once when the supervisor starts; on crash retries only
+                # re-fetch if the checkout has gone missing (no git hammering)
+                if first_spin or not dest_main.exists():
+                    await sync_git_plugin(entry["plugin"], plugin)
+            first_spin = False
             proc = await _spawn(name, entry)
             code = await proc.wait()
         except Exception as exc:
