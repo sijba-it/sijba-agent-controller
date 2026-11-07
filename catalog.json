@@ -43,18 +43,12 @@
     "kind": "docker"
   },
   "remote-control": {
-    "command": [
-      "/home/rbartl/.local/bin/claude",
-      "remote-control",
-      "--name",
-      "{name}",
-      "--permission-mode",
-      "auto",
-      "--capacity",
-      "2",
-      "--spawn=same-dir"
-    ],
-    "description": "Interactive Claude Code session paired to the Claude mobile app via Remote Control. No sijba chat relay \u2014 talk to it from your phone, not from a sijba channel; the controller only keeps the session alive.",
-    "kind": "local"
+    "description": "Claude Code Remote Control: phone prompts and answers in the sijba channel; chat messages relay to the active RC session.",
+    "env": {
+      "CLAUDE_CMD": "/home/rbartl/.local/bin/claude"
+    },
+    "kind": "git",
+    "ref": null,
+    "url": "https://github.com/sijba-it/sijba-claude-remote-control-plugin.git"
   }
 }

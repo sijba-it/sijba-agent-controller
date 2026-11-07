@@ -5,7 +5,7 @@ sijba chat. Replaces the two previous one-off scripts
 (`sijba_plugin_client.py`, `sijba-cursor-plugin/`'s old
 `cursor_plugin_client.py`), each of which was wired to exactly one fixed
 directory and ran as its own standalone systemd service — that code now
-lives in [sijba-claude-plugin](https://REDACTED-GIT-HOST/sijba/sijba-claude-plugin)
+lives in [sijba-claude-headless-plugin](https://github.com/sijba-it/sijba-claude-headless-plugin)
 and [sijba-cursor-plugin](https://REDACTED-GIT-HOST/sijba/sijba-cursor-plugin)
 as `main.py`, one project directory per registry entry, supervised by this
 controller instead.
@@ -22,7 +22,8 @@ controller instead.
 - **`catalog.py`** — the plugin catalog: which backends the controller
   knows how to run, and where they come from. There's no special-cased
   "builtin" — Claude and Cursor are `kind: git` entries too, pointing at
-  [sijba-claude-plugin](https://REDACTED-GIT-HOST/sijba/sijba-claude-plugin)
+  [sijba-claude-headless-plugin](https://github.com/sijba-it/sijba-claude-headless-plugin),
+  [sijba-claude-remote-control-plugin](https://github.com/sijba-it/sijba-claude-remote-control-plugin),
   and [sijba-cursor-plugin](https://REDACTED-GIT-HOST/sijba/sijba-cursor-plugin)
   respectively. You can add your own `kind: git` (repo URL, cloned on first
   use), `kind: docker` (image, pulled on first use), or `kind: local` (a
@@ -52,7 +53,7 @@ imports the controller's own code. A `kind: git` entry must contain a
   independent of the controller)
 - handles `/archive` and `/pause` locally: writes its own status directly
   into `REGISTRY_FILE`'s JSON (see `_set_registry_status` in
-  [sijba-claude-plugin/main.py](https://REDACTED-GIT-HOST/sijba/sijba-claude-plugin)
+  [sijba-claude-headless-plugin/main.py](https://github.com/sijba-it/sijba-claude-headless-plugin)
   for the reference implementation — no shared import, just the same JSON
   shape) and exits with a reserved code (`90` archived / `91` paused,
   `exit_codes.py`) *before* actually stopping
@@ -85,22 +86,17 @@ process lifetime. stdout/stderr are muted for this kind (tmux's raw ANSI
 screen redraws are noise in the shared journal, not useful for
 troubleshooting) — unlike git/docker plugins, which still inherit.
 
-The seeded example is `remote-control`:
+The seeded example is `remote-control` (`kind: git` →
+[sijba-claude-remote-control-plugin](https://github.com/sijba-it/sijba-claude-remote-control-plugin)):
 
 ```
 catalog list
-# remote-control [local]: claude --remote-control {name} — ...
-
 add my-project --plugin remote-control
 ```
 
-This starts `claude --remote-control my-project` in `my-project`'s
-directory, supervised exactly like any other project (crash-loop backoff,
-`archive`/`pause`/`restore`/`remove` all work the normal way) — but there's
-**no sijba channel and no chat relay**: you talk to it by pairing the
-Claude mobile app to the named Remote Control session directly, same as
-you would from an interactive terminal. `controller status <name>` tells
-you it's running; the conversation itself happens entirely outside sijba.
+The plugin keeps `claude remote-control` alive (tmux `sijba-<name>`),
+mirrors phone prompts and answers into the `remote-control:<name>` sijba
+channel, and relays sijba chat into the active RC session.
 
 ## Chat commands (channel `controller`, trigger `controller ...`)
 
@@ -183,11 +179,10 @@ sudo cp sijba-agent-controller.service /etc/systemd/system/
 sudo systemctl enable --now sijba-agent-controller
 ```
 
-Once projects are running through the controller, retire the two old
-standalone services it replaces (`sijba-claude-plugin.service`,
-`sijba-cursor-plugin.service`, if you had them installed) — the controller
-now spawns the same code from the catalog instead:
+Once projects are running through the controller, retire old standalone
+services (`sijba-cursor-plugin.service`, if you had them installed) — the
+controller now spawns plugins from the catalog instead:
 
 ```bash
-sudo systemctl disable --now sijba-claude-plugin sijba-cursor-plugin
+sudo systemctl disable --now sijba-cursor-plugin
 ```

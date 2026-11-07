@@ -1266,7 +1266,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "add_git_plugin",
         "description": "Register a new plugin sourced from a git repo. The repo must contain main.py "
-                        "at its root implementing the plugin contract (see sijba-claude-plugin for an example).",
+                        "at its root implementing the plugin contract (see sijba-claude-headless-plugin for an example).",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "url": {"type": "string"},
             "ref": {"type": "string"}, "description": {"type": "string"},
