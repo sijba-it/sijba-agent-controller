@@ -27,7 +27,7 @@ Delegate=yes
 # kill (git-kind children, the kind:local wrapper client) is already
 # handled explicitly by terminate_all_children() before the process exits.
 KillMode=process
-Environment=SIJBA_URL=https://sijba.edv-bartl.at
+Environment=SIJBA_URL=https://<account>.sijba.eu
 Environment=SIJBA_TOKEN=your-token-here
 Environment=WORKSPACE_ROOTS=/home/robert/workspaces/sijba
 # Defaults to controller-<hostname> if unset — only needed for a nicer

@@ -155,7 +155,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install websockets
 
-export SIJBA_URL=https://sijba.edv-bartl.at
+export SIJBA_URL=https://<account>.sijba.eu
 export SIJBA_TOKEN=your-token-here
 export WORKSPACE_ROOTS=/home/robert/workspaces/sijba   # comma-separated for multiple orgs
 # export CONTROLLER_NAME=controller-prod   # only if the default (controller-<hostname>) is ugly

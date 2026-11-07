@@ -60,7 +60,11 @@ from exit_codes import EXIT_ARCHIVED, EXIT_PAUSED
 # Config
 # ---------------------------------------------------------------------------
 
-SIJBA_URL = os.environ.get("SIJBA_URL", "wss://sijba.edv-bartl.at")
+SIJBA_URL = os.environ.get("SIJBA_URL", "")
+if not SIJBA_URL:
+    print("ERROR: SIJBA_URL environment variable required (e.g. wss://<account>.sijba.eu)", file=sys.stderr)
+    sys.exit(1)
+
 SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
 # Running one controller per host means each needs its own
 # plugin_id/channel_id/trigger, or the sijba server can't tell them apart
@@ -727,7 +731,7 @@ def cmd_allow_inject(name: str, allowed: bool) -> str:
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {SIJBA_TOKEN}",
-            # Cloudflare in front of sijba.edv-bartl.at blocks the default
+            # Cloudflare in front of <account>.sijba.eu blocks the default
             # "Python-urllib/x.y" User-Agent outright (error code 1010,
             # browser-integrity check) — found live, a real 403 with a
             # valid token. Any non-default UA clears it.
