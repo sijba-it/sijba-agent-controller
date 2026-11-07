@@ -11,6 +11,17 @@
     "ref": null,
     "url": "https://github.com/sijba-it/sijba-claude-channel-plugin.git"
   },
+  "claude-headless": {
+    "added_at": 1794064168.4954286,
+    "api": null,
+    "description": "",
+    "env": {
+      "CLAUDE_CMD": "/home/rbartl/.local/bin/claude"
+    },
+    "kind": "git",
+    "ref": null,
+    "url": "https://github.com/sijba-it/sijba-claude-headless-plugin.git"
+  },
   "cursor": {
     "added_at": 1786864378.6410522,
     "description": "Cursor Agent CLI, one-shot turns via --resume",

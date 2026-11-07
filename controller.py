@@ -1081,11 +1081,15 @@ async def dispatch_command(text: str) -> Optional[str]:
             pos, flags = _parse_args(rest)
             if not pos:
                 return "usage: mkdir <name> [--root R]"
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return cmd_mkdir(pos[0], flags.get("root"))
         if cmd == "add":
             pos, flags = _parse_args(rest)
             if not pos:
                 return "usage: add <name> [--path P] [--plugin cursor|remote-control|...]"
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return await cmd_add(pos[0], flags.get("path"), flags.get("plugin", "remote-control"))
         if cmd == "catalog":
             sub, _, subrest = rest.strip().partition(" ")
@@ -1135,16 +1139,22 @@ async def dispatch_command(text: str) -> Optional[str]:
             pos, _ = _parse_args(rest)
             if not pos:
                 return "usage: status <name>"
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return cmd_status(pos[0])
         if cmd == "archive":
             pos, _ = _parse_args(rest)
             if not pos:
                 return "usage: archive <name>"
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return await cmd_archive(pos[0])
         if cmd == "pause":
             pos, _ = _parse_args(rest)
             if not pos:
                 return "usage: pause <name>"
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return await cmd_pause(pos[0])
         if cmd == "allow-inject":
             pos, _ = _parse_args(rest)
@@ -1155,11 +1165,15 @@ async def dispatch_command(text: str) -> Optional[str]:
             pos, _ = _parse_args(rest)
             if not pos:
                 return f"usage: {cmd} <name>"
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return cmd_restore(pos[0])
         if cmd == "remove":
             pos, flags = _parse_args(rest)
             if not pos:
                 return "usage: remove <name> [--wipe]"
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return await cmd_remove(pos[0], flags.get("wipe") == "true")
         if cmd == "pull":
             pos, _ = _parse_args(rest)
@@ -1347,7 +1361,11 @@ SYSTEM_PROMPT = (
     "'mit Label/Name X' name the project (name= argument = chat trigger / "
     "channel label). Example: 'starte plugin Cursor in /home/x/sijba mit "
     "Label/Name sijba-root' -> add_project(name='sijba-root', "
-    "path='/home/x/sijba', plugin='cursor'). Keep the project name exactly as "
+    "path='/home/x/sijba', plugin='cursor'). Likewise 'add claude-channel plugin in "
+    "new directory edvbartl/tmux-recherche with name tmux-recherche' -> "
+    "mkdir(name='tmux-recherche', root='edvbartl'), then add_project("
+    "name='tmux-recherche', path=<path mkdir returned>, plugin='claude-channel'). "
+    "Keep the project name exactly as "
     "the user gave it — never split a multi-word name across the search filter "
     "and the registered project name. If they don't give a name/Label at all, "
     "derive one from the target directory's own name (e.g. '/home/x/Obsidian' "
