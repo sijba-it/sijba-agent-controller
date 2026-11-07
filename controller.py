@@ -123,6 +123,7 @@ def _age(ts: float) -> str:
 _procs: dict[str, asyncio.subprocess.Process] = {}
 _supervisors: dict[str, asyncio.Task] = {}
 _intentional_stop: dict[str, str] = {}  # name -> "archived" | "paused" | "removed", set right before killing
+_restart_requested: set[str] = set()     # stopped by `pull` to pick up new code: respawn at once, no backoff
 
 # kind:local wraps a full-screen terminal UI (tmux) whose raw ANSI screen
 # redraws are noise in the shared journal (see `quiet` in _spawn) — but
@@ -440,6 +441,11 @@ async def ensure_running(name: str) -> None:
             _log(f"{name}: stopped ({stop_reason}, exit={code})")
             _supervisors.pop(name, None)
             return
+        if name in _restart_requested:
+            _restart_requested.discard(name)
+            _log(f"{name}: restarting with updated plugin code (exit={code})")
+            backoff = BACKOFF_BASE
+            continue
         if code == EXIT_ARCHIVED:
             _log(f"{name}: self-archived (exit={code})")
             _supervisors.pop(name, None)
@@ -520,6 +526,101 @@ async def stop_process(name: str, reason: str) -> None:
         await kill_proc.wait()
     except FileNotFoundError:
         pass
+
+
+async def _run(*cmd: str) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+async def _plugin_revision(plugin_name: str, plugin: dict) -> str:
+    """Short commit (git) or image id (docker) of what a plugin currently runs."""
+    if plugin["kind"] == "git":
+        code, out = await _run("git", "-C", str(catalog.PLUGINS_DIR / plugin_name), "rev-parse", "--short", "HEAD")
+    elif plugin["kind"] == "docker":
+        code, out = await _run("docker", "image", "inspect", "-f", "{{.Id}}", plugin["image"])
+        out = out.removeprefix("sha256:")[:12]
+    else:
+        return ""
+    return out if code == 0 else ""
+
+
+async def _update_plugin(plugin_name: str, plugin: dict) -> tuple[str, str, str]:
+    """Fetch the newest code for one catalog plugin -> (before, after, error)."""
+    before = await _plugin_revision(plugin_name, plugin)
+    error = ""
+    if plugin["kind"] == "git" and not (catalog.PLUGINS_DIR / plugin_name / "main.py").exists():
+        try:
+            await ensure_fetched(plugin_name, plugin)
+        except RuntimeError as exc:
+            error = str(exc)
+    elif plugin["kind"] == "git":
+        code, out = await _run("git", "-C", str(catalog.PLUGINS_DIR / plugin_name), "pull", "--ff-only", "-q")
+        error = "" if code == 0 else (out[:200] or f"git pull exit {code}")
+    elif plugin["kind"] == "docker":
+        code, out = await _run("docker", "pull", "-q", plugin["image"])
+        error = "" if code == 0 else (out[:200] or f"docker pull exit {code}")
+    _plugin_synced_at[plugin_name] = time.time()
+    return before, await _plugin_revision(plugin_name, plugin), error
+
+
+async def restart_project(name: str) -> bool:
+    """Stop a running project so its supervisor respawns it right away on the
+    current plugin code. False if nothing was running (a supervisor in its
+    backoff sleep picks up the new code on its next spawn anyway)."""
+    proc = _procs.get(name)
+    if not proc or proc.returncode is not None:
+        return False
+    _restart_requested.add(name)
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        proc.kill()
+    return True
+
+
+async def cmd_pull(target: Optional[str] = None) -> str:
+    """`pull`: update every catalog plugin, restart the active projects whose
+    plugin actually changed. `pull <plugin>`: just that catalog entry and its
+    projects. `pull <project>`: that project's plugin, restart only it."""
+    plugins = catalog.list_plugins()
+    active = registry.list_projects(status="active")
+    only: Optional[set[str]] = None
+    if not target:
+        names = sorted(plugins)
+    elif target in plugins:
+        names = [target]
+    elif registry.get(target):
+        names, only = [registry.get(target)["plugin"]], {target}
+    else:
+        return f"No catalog entry or project named {target!r}. See `catalog list` / `list`."
+    lines = []
+    for plugin_name in names:
+        plugin = plugins.get(plugin_name)
+        if plugin is None:
+            lines.append(f"{plugin_name}: not in the catalog")
+            continue
+        if plugin["kind"] not in ("git", "docker"):
+            lines.append(f"{plugin_name}: {plugin['kind']} command, nothing to pull")
+            continue
+        async with _plugin_sync_locks.setdefault(plugin_name, asyncio.Lock()):
+            before, after, error = await _update_plugin(plugin_name, plugin)
+        if error:
+            lines.append(f"{plugin_name}: pull failed — {error}")
+            continue
+        if before == after:
+            lines.append(f"{plugin_name}: up to date ({after or '?'})")
+            continue
+        users = sorted(n for n, e in active.items() if e.get("plugin") == plugin_name and (only is None or n in only))
+        restarted = [n for n in users if await restart_project(n)]
+        if restarted:
+            _log(f"pull: {plugin_name} {before} -> {after}, restarted {', '.join(restarted)}")
+        lines.append(f"{plugin_name}: {before or 'new'} → {after}"
+                     + (f", restarted: {', '.join(restarted)}" if restarted else ", no running projects"))
+    return "\n".join(lines) or "Nothing in the catalog."
 
 
 def boot() -> None:
@@ -957,7 +1058,8 @@ HELP = (
     "catalog add <name> --local \"cmd {name} {work_dir}\" [--api A] [--env K=V] [--desc D] | "
     "catalog set-env <name> --env K=V,K2=V2 | catalog remove <name> | "
     "apis list | apis add <name> --url URL [--key K] [--desc D] | "
-    "apis set-key <name> <key> | apis remove <name>"
+    "apis set-key <name> <key> | apis remove <name> | "
+    "pull [plugin|project] (update plugin code, restart what changed)"
 )
 
 
@@ -1059,6 +1161,11 @@ async def dispatch_command(text: str) -> Optional[str]:
             if not pos:
                 return "usage: remove <name> [--wipe]"
             return await cmd_remove(pos[0], flags.get("wipe") == "true")
+        if cmd == "pull":
+            pos, _ = _parse_args(rest)
+            if len(pos) > 1:
+                return None  # extra words = free text, not an exact command
+            return await cmd_pull(pos[0] if pos else None)
         if cmd in ("help", ""):
             return HELP
     except Exception as exc:
@@ -1118,6 +1225,12 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "restore_project", "description": "Reactivate an archived/paused project.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "pull_updates", "description": "Update plugin code (git pull / docker pull) and restart "
+            "the running projects whose plugin changed. No target = every catalog plugin; target = one "
+            "catalog plugin name or one project name.",
+        "parameters": {"type": "object", "properties": {"target": {"type": "string"}}},
     }},
     {"type": "function", "function": {
         "name": "remove_project", "description": "Unregister a project. wipe=true also deletes its directory.",
@@ -1191,6 +1304,7 @@ _TOOL_IMPL = {
     "status": lambda **kw: cmd_status(kw["name"]),
     "archive_project": lambda **kw: cmd_archive(kw["name"]),
     "restore_project": lambda **kw: cmd_restore(kw["name"]),
+    "pull_updates": lambda **kw: cmd_pull(kw.get("target")),
     "remove_project": lambda **kw: cmd_remove(kw["name"], kw.get("wipe", False)),
     "list_catalog": lambda **kw: cmd_catalog_list(),
     "list_apis": lambda **kw: cmd_apis_list(),

@@ -115,6 +115,10 @@ pause <name>                             stop, no auto-restart (until resumed)
 restore <name> / resume <name>           reactivate
 remove <name> [--wipe]                   unregister (--wipe also deletes the directory)
 log [n]                                  controller's own last n log lines (default 10)
+pull [plugin|project]                    update plugin code (git pull / docker pull) and restart the
+                                         active projects whose plugin actually changed. No argument:
+                                         every catalog plugin. A catalog name: that plugin and its
+                                         projects. A project name: its plugin, restart only that project.
 catalog list                             available plugins, flags any that need an unconfigured API
 catalog add <name> --git URL [--ref R] [--api A]     register a git-sourced plugin
 catalog add <name> --docker IMAGE [--api A]          register a docker-sourced plugin
