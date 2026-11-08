@@ -85,7 +85,7 @@ def get(name: str) -> Optional[dict]:
     return load()["projects"].get(name)
 
 
-def add(name: str, path: str, plugin: str) -> dict:
+def add(name: str, path: str, plugin: str, description: str = "") -> dict:
     if catalog.get(plugin) is None:
         raise ValueError(f"unknown plugin {plugin!r} — see 'catalog list'")
     path = str(Path(path).expanduser())
@@ -119,6 +119,8 @@ def add(name: str, path: str, plugin: str) -> dict:
             "status": "active",
             "created_at": time.time(),
         }
+        if description:
+            entry["description"] = description
         data["projects"][name] = entry
         return dict(entry)
 
@@ -135,6 +137,18 @@ def set_can_inject(name: str, allowed: bool) -> None:
         if name not in data["projects"]:
             raise KeyError(name)
         data["projects"][name]["can_inject"] = bool(allowed)
+
+
+def set_description(name: str, description: str) -> None:
+    """What the project is about — plugins put it in their channel hint, which
+    is what sijba's router tells channels apart by. Empty clears it."""
+    with _locked() as data:
+        if name not in data["projects"]:
+            raise KeyError(name)
+        if description:
+            data["projects"][name]["description"] = description
+        else:
+            data["projects"][name].pop("description", None)
 
 
 def set_status(name: str, status: str) -> None:

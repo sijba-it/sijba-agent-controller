@@ -102,7 +102,7 @@ channel, and relays sijba chat into the active RC session.
 
 ```
 list                                     all projects + live status
-add <name> [--path P] [--plugin T]       register + start (default plugin: claude)
+add <name> [--path P] [--plugin T] [--desc D]  register + start; --desc = see describe
 mkdir <name> [--root R]                  create a new project dir (does not register)
 paths [filter]                           search directories under WORKSPACE_ROOTS
 status <name>                            details for one project
@@ -111,6 +111,10 @@ pause <name>                             stop, no auto-restart (until resumed)
 restore <name> / resume <name>           reactivate
 remove <name> [--wipe]                   unregister (--wipe also deletes the directory)
 log [n]                                  controller's own last n log lines (default 10)
+describe <name> [text]                   what the project is about; plugins send it as their channel
+                                         hint, which the router picks channels by. No text: show it,
+                                         '-': clear (then the plugin uses the project's README.md).
+                                         Restarts the project so the channel re-registers.
 pull [plugin|project]                    update plugin code (git pull / docker pull) and restart the
                                          active projects whose plugin actually changed. No argument:
                                          every catalog plugin. A catalog name: that plugin and its

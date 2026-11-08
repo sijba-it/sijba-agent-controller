@@ -123,7 +123,7 @@ def _age(ts: float) -> str:
 _procs: dict[str, asyncio.subprocess.Process] = {}
 _supervisors: dict[str, asyncio.Task] = {}
 _intentional_stop: dict[str, str] = {}  # name -> "archived" | "paused" | "removed", set right before killing
-_restart_requested: set[str] = set()     # stopped by `pull` to pick up new code: respawn at once, no backoff
+_restart_requested: set[str] = set()     # stopped by `pull` / `describe` to respawn at once, no backoff
 
 # kind:local wraps a full-screen terminal UI (tmux) whose raw ANSI screen
 # redraws are noise in the shared journal (see `quiet` in _spawn) — but
@@ -164,6 +164,8 @@ def _dynamic_env(name: str, entry: dict) -> dict:
         "PROJECT_NAME": name,
         "WORK_DIR": entry["path"],
         "REGISTRY_FILE": str(registry.REGISTRY_FILE),
+        # channel hint: what this project is about (see `describe`)
+        "PROJECT_DESCRIPTION": entry.get("description", ""),
     }
 
 
@@ -310,6 +312,7 @@ def _spawn_command(name: str, entry: dict, plugin: dict) -> tuple[list[str], dic
             "-v", f"{registry.REGISTRY_FILE}:/registry.json",
             "-e", f"SIJBA_URL={SIJBA_URL}", "-e", f"SIJBA_TOKEN={SIJBA_TOKEN}",
             "-e", f"PROJECT_NAME={name}", "-e", "WORK_DIR=/work",
+            "-e", f"PROJECT_DESCRIPTION={entry.get('description', '')}",
             "-e", "REGISTRY_FILE=/registry.json",
         ]
         for key, val in {**_resolve_api_env(plugin), **plugin.get("env", {})}.items():
@@ -443,7 +446,7 @@ async def ensure_running(name: str) -> None:
             return
         if name in _restart_requested:
             _restart_requested.discard(name)
-            _log(f"{name}: restarting with updated plugin code (exit={code})")
+            _log(f"{name}: restarting on request (exit={code})")
             backoff = BACKOFF_BASE
             continue
         if code == EXIT_ARCHIVED:
@@ -582,6 +585,24 @@ async def restart_project(name: str) -> bool:
     return True
 
 
+async def cmd_describe(name: str, description: Optional[str] = None) -> str:
+    """Show / set what a project is about. Plugins use it as their channel hint
+    — the router tells channels apart by it — so a change restarts the project
+    to re-register the channel with the new text."""
+    entry = registry.get(name)
+    if entry is None:
+        return f"No such project: {name}"
+    if description is None:
+        return f"{name}: {entry.get('description') or '(no description — the plugin falls back to the README.md)'}"
+    description = description.strip()
+    if description in ("-", '""', "''"):
+        description = ""
+    registry.set_description(name, description)
+    restarted = await restart_project(name)
+    return (f"{name}: description {'set' if description else 'cleared'}"
+            + (" — channel re-registered." if restarted else " — used on the next start."))
+
+
 async def cmd_pull(target: Optional[str] = None) -> str:
     """`pull`: update every catalog plugin, restart the active projects whose
     plugin actually changed. `pull <plugin>`: just that catalog entry and its
@@ -644,7 +665,8 @@ def cmd_list() -> str:
         live = "running" if name in _procs else ("supervised" if name in _supervisors else "-")
         since = e.get("status_changed_at") or e.get("created_at")
         age = f", {_age(since)}" if since else ""
-        lines.append(f"- {name}: {e['plugin']} @ {e['path']} [{e['status']}/{live}{age}]")
+        desc = f" — {e['description']}" if e.get("description") else ""
+        lines.append(f"- {name}: {e['plugin']} @ {e['path']} [{e['status']}/{live}{age}]{desc}")
     return "\n".join(lines)
 
 
@@ -686,7 +708,8 @@ def _trust_claude_dir(path: str) -> None:
         _log(f"_trust_claude_dir({path}): {exc}")
 
 
-async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-control") -> str:
+async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-control",
+                  description: str = "") -> str:
     global _pending_mkdir_retry
     plugin_entry = catalog.get(plugin)
     if plugin_entry is None:
@@ -758,7 +781,7 @@ async def cmd_add(name: str, path: Optional[str] = None, plugin: str = "remote-c
     except Exception as exc:
         return f"Fetch failed: {exc}"
     _trust_claude_dir(path)
-    entry = registry.add(name, path, plugin)
+    entry = registry.add(name, path, plugin, description)
     start_supervising(name)
     return f"Added {name}: {entry['plugin']} @ {entry['path']}, starting."
 
@@ -857,7 +880,8 @@ def cmd_status(name: str) -> str:
     changed = f" ({_age(entry['status_changed_at'])})" if entry.get("status_changed_at") else ""
     return (
         f"{name}\n  path: {entry['path']}\n  plugin: {entry['plugin']}\n"
-        f"  status: {entry['status']}{changed}\n  live: {live}{created}"
+        f"  status: {entry['status']}{changed}\n  live: {live}{created}\n"
+        f"  description: {entry.get('description') or '(none — the plugin falls back to the README.md)'}"
     )
 
 
@@ -1049,7 +1073,7 @@ def _parse_args(rest: str) -> tuple[list[str], dict[str, str]]:
 
 
 HELP = (
-    "Commands: list | add <name> [--path P] [--plugin cursor|remote-control|...] | "
+    "Commands: list | add <name> [--path P] [--plugin cursor|remote-control|...] [--desc D] | "
     "mkdir <name> [--root R] | paths [filter] | status <name> | "
     "archive <name> | pause <name> | restore <name> | remove <name> [--wipe] | log [n] | "
     "allow-inject <name> true|false | "
@@ -1059,7 +1083,8 @@ HELP = (
     "catalog set-env <name> --env K=V,K2=V2 | catalog remove <name> | "
     "apis list | apis add <name> --url URL [--key K] [--desc D] | "
     "apis set-key <name> <key> | apis remove <name> | "
-    "pull [plugin|project] (update plugin code, restart what changed)"
+    "pull [plugin|project] (update plugin code, restart what changed) | "
+    "describe <name> [text] (what the project is about — the channel hint the router uses)"
 )
 
 
@@ -1090,7 +1115,8 @@ async def dispatch_command(text: str) -> Optional[str]:
                 return "usage: add <name> [--path P] [--plugin cursor|remote-control|...]"
             if len(pos) > 1:
                 return None  # extra words = free text, not an exact command (names with spaces must be quoted)
-            return await cmd_add(pos[0], flags.get("path"), flags.get("plugin", "remote-control"))
+            return await cmd_add(pos[0], flags.get("path"), flags.get("plugin", "remote-control"),
+                                 flags.get("desc", ""))
         if cmd == "catalog":
             sub, _, subrest = rest.strip().partition(" ")
             pos, flags = _parse_args(subrest)
@@ -1175,6 +1201,16 @@ async def dispatch_command(text: str) -> Optional[str]:
             if len(pos) > 1:
                 return None  # extra words = free text, not an exact command (names with spaces must be quoted)
             return await cmd_remove(pos[0], flags.get("wipe") == "true")
+        if cmd == "describe":
+            r = rest.strip()
+            if not r:
+                return "usage: describe <name> [text]  (text '-' clears it)"
+            if r[0] in "\"'":          # quoted name with spaces
+                end = r.find(r[0], 1)
+                name, text = (r[1:end], r[end + 1:].strip()) if end > 0 else (r[1:], "")
+            else:
+                name, _, text = r.partition(" ")
+            return await cmd_describe(name, text.strip() or None)
         if cmd == "pull":
             pos, _ = _parse_args(rest)
             if len(pos) > 1:
@@ -1226,6 +1262,8 @@ TOOLS = [
                 "(e.g. 'sijba-root'). Not the plugin. Must not equal a catalog plugin name."},
             "path": {"type": "string"},
             "plugin": {"type": "string", "description": "catalog plugin name, e.g. 'remote-control', 'cursor', or a custom one"},
+            "description": {"type": "string", "description": "one sentence on what the project is about — "
+                "becomes the channel hint the router uses to pick this channel"},
         }, "required": ["name"]},
     }},
     {"type": "function", "function": {
@@ -1239,6 +1277,12 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "restore_project", "description": "Reactivate an archived/paused project.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "describe_project", "description": "Show (no description given) or set what a project is "
+            "about. It becomes the project's channel hint, which the sijba router uses to pick the channel.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "description": {"type": "string"}}, "required": ["name"]},
     }},
     {"type": "function", "function": {
         "name": "pull_updates", "description": "Update plugin code (git pull / docker pull) and restart "
@@ -1314,7 +1358,9 @@ _TOOL_IMPL = {
     "list_projects": lambda **kw: cmd_list(),
     "list_paths": lambda **kw: cmd_paths(kw.get("filter", "")),
     "mkdir": lambda **kw: cmd_mkdir(kw["name"], kw.get("root")),
-    "add_project": lambda **kw: cmd_add(kw["name"], kw.get("path"), kw.get("plugin", "remote-control")),
+    "add_project": lambda **kw: cmd_add(kw["name"], kw.get("path"), kw.get("plugin", "remote-control"),
+                                        kw.get("description", "")),
+    "describe_project": lambda **kw: cmd_describe(kw["name"], kw.get("description")),
     "status": lambda **kw: cmd_status(kw["name"]),
     "archive_project": lambda **kw: cmd_archive(kw["name"]),
     "restore_project": lambda **kw: cmd_restore(kw["name"]),
