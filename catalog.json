@@ -30,7 +30,7 @@
     },
     "kind": "git",
     "ref": null,
-    "url": "ssh://git@REDACTED-GIT-HOST:7999/sijba/sijba-cursor-plugin.git"
+    "url": "https://github.com/sijba-it/sijba-cursor-plugin.git"
   },
   "pi": {
     "added_at": 1789307606.5122457,
