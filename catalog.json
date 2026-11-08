@@ -45,7 +45,8 @@
   "remote-control": {
     "description": "Claude Code Remote Control: phone prompts and answers in the sijba channel; chat messages relay to the active RC session.",
     "env": {
-      "CLAUDE_CMD": "/home/rbartl/.local/bin/claude"
+      "CLAUDE_CMD": "/home/rbartl/.local/bin/claude",
+      "REMOTE_CONTROL_CAPACITY": "1"
     },
     "kind": "git",
     "ref": null,

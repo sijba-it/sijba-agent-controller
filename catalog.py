@@ -43,7 +43,7 @@ def _default_data() -> dict:
             "kind": "git",
             "url": "https://github.com/sijba-it/sijba-claude-remote-control-plugin.git",
             "ref": None,
-            "env": {"CLAUDE_CMD": "claude"},
+            "env": {"CLAUDE_CMD": "claude", "REMOTE_CONTROL_CAPACITY": "1"},
             "description": (
                 "Claude Code Remote Control: phone prompts and answers in the sijba "
                 "channel; chat messages relay to the active RC session."
